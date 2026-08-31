@@ -21,6 +21,7 @@
 #include <cstring>
 #include <format>
 #include <atomic>
+#include <functional>
 #include "core/log.hpp"
 
 #include "process/flat_tree.hpp"
@@ -31,16 +32,19 @@ namespace clew {
 
 class windivert_socket_udp {
 public:
+    // resolve_unknown_pid: see windivert_socket. Same fallback, same contract.
     windivert_socket_udp(asio::io_context& ioc,
                          asio::strand<asio::io_context::executor_type>& strand,
                          flat_tree& tree,
                          rule_engine_v3& rules,
-                         UdpPortTracker& tracker)
+                         UdpPortTracker& tracker,
+                         std::function<bool(DWORD)> resolve_unknown_pid)
         : ioc_(ioc)
         , strand_(strand)
         , tree_(tree)
         , rules_(rules)
         , tracker_(tracker)
+        , resolve_unknown_pid_(std::move(resolve_unknown_pid))
     {}
 
     ~windivert_socket_udp() { close(); }
@@ -109,6 +113,7 @@ private:
     flat_tree& tree_;
     rule_engine_v3& rules_;
     UdpPortTracker& tracker_;
+    std::function<bool(DWORD)> resolve_unknown_pid_;
 
     HANDLE handle_{INVALID_HANDLE_VALUE};
     bool use_iocp_{true};
@@ -188,6 +193,14 @@ private:
         const DWORD pid = addr.Socket.ProcessId;
         const uint16_t src_port = static_cast<uint16_t>(addr.Socket.LocalPort);
         const bool is_connect = (addr.Event == WINDIVERT_EVENT_SOCKET_CONNECT);
+
+        // Resolve before the rule gate, not after: should_proxy_protocol looks
+        // the PID up in the tree itself and answers false for anything it
+        // doesn't know, so a process younger than the ETW ProcessStart latency
+        // would be dropped here before ever reaching the lookup below.
+        if (tree_.find_by_pid(pid) == INVALID_IDX) {
+            if (!resolve_unknown_pid_ || !resolve_unknown_pid_(pid)) return;
+        }
 
         // Check if this PID should be proxied for UDP protocol
         if (!rules_.should_proxy_protocol(tree_, pid, "udp")) return;

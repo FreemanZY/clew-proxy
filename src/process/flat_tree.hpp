@@ -169,6 +169,121 @@ inline std::string query_process_image_path(DWORD pid) {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Synchronous single-process queries (SOCKET-layer fallback).
+//
+// ETW ProcessStart is authoritative but late: the real-time session has a 1s
+// FlushTimer floor, so a process that connects within ~1-2s of birth is not in
+// the tree yet and the SOCKET layer would let it through as direct. These
+// helpers let the manager resolve such a PID on the spot -- at the moment a
+// SOCKET CONNECT event names a PID, that process is by definition still alive
+// and openable.
+//
+// The PSN must be the real one, never synthesized: (pid, psn) is the tree's
+// identity key, so a fake PSN would make the ETW START that arrives a second
+// later look like a different process and tombstone the entry we just
+// classified, silently dropping its proxy state.
+// ---------------------------------------------------------------------------
+
+using nt_query_process_fn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+inline nt_query_process_fn nt_query_process() {
+    static auto fn = reinterpret_cast<nt_query_process_fn>(
+        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess"));
+    return fn;
+}
+
+// ProcessBasicInformation (class 0). Only the trailing parent-pid field is read.
+struct nt_process_basic_information {
+    LONG      ExitStatus;
+    PVOID     PebBaseAddress;
+    ULONG_PTR AffinityMask;
+    LONG      BasePriority;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR InheritedFromUniqueProcessId;
+};
+
+// Parent PID as recorded at creation time. Windows recycles PIDs, so this may
+// name a process that has since been replaced -- callers must validate the
+// linkage (by PSN when the parent is alive, by create_time ordering otherwise)
+// before trusting it. Returns 0 on failure.
+inline DWORD query_parent_pid(HANDLE h) {
+    auto NtQuery = nt_query_process();
+    if (!NtQuery) return 0;
+
+    nt_process_basic_information pbi{};
+    ULONG ret_len = 0;
+    if (NtQuery(h, 0 /* ProcessBasicInformation */, &pbi, sizeof(pbi), &ret_len) < 0) {
+        return 0;
+    }
+    return static_cast<DWORD>(pbi.InheritedFromUniqueProcessId);
+}
+
+// ProcessSequenceNumber (class 92, Win10 1709+; this project targets 2004+).
+// Same value space as the ETW ProcessSequenceNumber field -- that equality is
+// what makes a synchronously inserted entry indistinguishable from the ETW one
+// that follows, so the late START is a no-op instead of a re-insert.
+// Returns INVALID_PSN on failure.
+inline uint64_t query_process_psn(HANDLE h) {
+    auto NtQuery = nt_query_process();
+    if (!NtQuery) return INVALID_PSN;
+
+    uint64_t psn = 0;
+    ULONG ret_len = 0;
+    if (NtQuery(h, 92 /* ProcessSequenceNumber */, &psn, sizeof(psn), &ret_len) < 0) {
+        return INVALID_PSN;
+    }
+    return psn;
+}
+
+// Creation time; zeroed FILETIME on failure.
+inline FILETIME query_process_create_time(HANDLE h) {
+    FILETIME creation{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(h, &creation, &exited, &kernel, &user)) return FILETIME{};
+    return creation;
+}
+
+// Everything the tree needs about one live process, gathered from a single
+// handle so a resolve costs one OpenProcess rather than four.
+struct live_process_info {
+    DWORD        pid{0};
+    DWORD        parent_pid{0};
+    uint64_t     psn{INVALID_PSN};
+    FILETIME     create_time{};
+    std::wstring name;  // basename only, matching the ETW ImageName convention
+};
+
+// Returns false when the process cannot be opened or identified (already gone,
+// PPL-protected, PID 0/4, or no PSN available). Callers treat false as "leave
+// it alone", which is exactly today's behavior for an unknown PID -- so a
+// failed resolve is a no-op, not a regression.
+inline bool query_live_process(DWORD pid, live_process_info& out) {
+    auto h = wrap_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!h) return false;
+
+    // Identity first: without a real PSN we must not insert anything.
+    const uint64_t psn = query_process_psn(h.get());
+    if (psn == INVALID_PSN) return false;
+
+    WCHAR path_buf[MAX_PATH];
+    DWORD path_len = MAX_PATH;
+    if (!QueryFullProcessImageNameW(h.get(), 0, path_buf, &path_len)) return false;
+
+    // ETW stores the basename (see the ImageName decode in etw_consumer); rule
+    // matching compares against that, so strip the directory here too.
+    const wchar_t* basename = path_buf;
+    for (DWORD k = 0; k < path_len; ++k) {
+        if (path_buf[k] == L'\\') basename = path_buf + k + 1;
+    }
+
+    out.pid         = pid;
+    out.psn         = psn;
+    out.parent_pid  = query_parent_pid(h.get());
+    out.create_time = query_process_create_time(h.get());
+    out.name.assign(basename);
+    return true;
+}
+
 // Side-map value: index into entries_ + PSN tag for disambiguation.
 struct side_entry {
     uint32_t index;

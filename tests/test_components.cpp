@@ -1110,6 +1110,100 @@ TEST(system_dns_legacy_state_defaults_to_manual_restore) {
 }
 
 // ============================================================
+// SOCKET-layer sync resolve (unknown-PID fallback)
+// ============================================================
+
+TEST(sync_resolve_reads_live_process_identity) {
+    // Smoke-test the NtQueryInformationProcess class numbers against the one
+    // process we know everything about: ourselves. If class 92
+    // (ProcessSequenceNumber) or class 0 (ProcessBasicInformation) were wrong,
+    // the fallback would silently refuse to resolve anything.
+    clew::live_process_info self;
+    ASSERT_TRUE(clew::query_live_process(GetCurrentProcessId(), self));
+
+    ASSERT_EQ(self.pid, GetCurrentProcessId());
+    ASSERT_TRUE(self.psn != clew::INVALID_PSN);   // class 92 answered
+    ASSERT_TRUE(self.parent_pid != 0);            // class 0 answered
+    ASSERT_TRUE(self.create_time.dwLowDateTime != 0 ||
+                self.create_time.dwHighDateTime != 0);
+
+    // Name must be the basename, matching what ETW stores — rule matching
+    // compares against that form.
+    ASSERT_TRUE(!self.name.empty());
+    ASSERT_TRUE(self.name.find(L'\\') == std::wstring::npos);
+
+    // A PID that cannot exist yields "leave it alone", never a partial entry.
+    clew::live_process_info bogus;
+    ASSERT_FALSE(clew::query_live_process(0xFFFFFFF0u, bogus));
+}
+
+TEST(sync_resolve_late_etw_start_is_idempotent) {
+    // The fallback inserts using the process's real PSN, so the ETW START that
+    // lands ~1.5s later carries the same (pid, psn) and must be a no-op. With a
+    // synthesized PSN, add_entry would read that START as PID reuse, tombstone
+    // the entry the fallback just classified and silently drop its proxy state.
+    flat_tree tree;
+    FILETIME ft{};
+    const uint64_t real_psn = 4242;
+
+    uint32_t idx = tree.add_entry(1000, 0, real_psn, ROOT_PSN_SENTINEL, ft, L"git.exe");
+    tree.mark_root(idx);
+    tree.at(idx).group_id = 7;
+    tree.at(idx).set_flag(clew::entry_flags::AUTO_MATCHED);
+
+    // Replay of the same identity, i.e. the delayed ETW START.
+    uint32_t again = tree.add_entry(1000, 0, real_psn, ROOT_PSN_SENTINEL, ft, L"git.exe");
+    ASSERT_EQ(again, idx);
+    ASSERT_EQ(tree.at(idx).group_id, uint32_t{7});
+    ASSERT_TRUE(tree.at(idx).has_flag(clew::entry_flags::AUTO_MATCHED));
+
+    // Contrast: a different PSN under the same PID is genuine reuse, and there
+    // the reset is the correct behavior.
+    uint32_t reused = tree.add_entry(1000, 0, real_psn + 1, ROOT_PSN_SENTINEL, ft, L"git.exe");
+    ASSERT_TRUE(reused != idx);
+    ASSERT_EQ(tree.at(reused).group_id, NO_PROXY);
+}
+
+TEST(sync_resolve_chain_must_insert_top_down) {
+    // resolve_pid_now collects unknown ancestors and inserts them parent-first.
+    // The order is load-bearing, not cosmetic: inheritance tests the parent PID
+    // against the rule's matched set, so a child inserted ahead of its parent
+    // stays unmatched forever. This is exactly the git.exe -> git-remote-https
+    // case, where both processes are younger than the ETW latency window.
+    const AutoRule rule = make_rule("git_tree", "git.exe", /*hack_tree=*/true, /*group=*/5);
+    FILETIME ft{};
+
+    {   // Top-down: parent first, child inherits.
+        rule_engine_v3 engine;
+        engine.set_auto_rules({rule});
+        flat_tree tree;
+
+        uint32_t pidx = tree.add_entry(2000, 0, 1, ROOT_PSN_SENTINEL, ft, L"git.exe");
+        tree.mark_root(pidx);
+        engine.on_process_start(tree, pidx);
+
+        uint32_t cidx = tree.add_entry(2001, 2000, 2, 1, ft, L"git-remote-https.exe");
+        tree.attach_child(pidx, cidx);
+        engine.on_process_start(tree, cidx);
+
+        ASSERT_EQ(tree.at(pidx).group_id, uint32_t{5});
+        ASSERT_EQ(tree.at(cidx).group_id, uint32_t{5});
+    }
+
+    {   // Bottom-up: child first, parent unknown -> no inheritance.
+        rule_engine_v3 engine;
+        engine.set_auto_rules({rule});
+        flat_tree tree;
+
+        uint32_t cidx = tree.add_entry(2001, 2000, 2, 1, ft, L"git-remote-https.exe");
+        tree.mark_root(cidx);
+        engine.on_process_start(tree, cidx);
+
+        ASSERT_EQ(tree.at(cidx).group_id, NO_PROXY);
+    }
+}
+
+// ============================================================
 // Main runner
 // ============================================================
 

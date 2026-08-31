@@ -77,6 +77,16 @@ public:
     // --- ETW entry point (single dispatch, called on strand after ETW thread posts) ---
     void apply_etw_event_on_strand(const etw_process_event& evt);
 
+    // --- SOCKET-layer fallback (caller must be inside strand) ---
+    // Resolve a PID the tree hasn't seen yet: query it and any unknown
+    // ancestors from the OS, insert them top-down, and classify. The WinDivert
+    // SOCKET layers call this when a CONNECT event names an unknown process —
+    // such a process is by definition still alive, it is just younger than the
+    // ~1-2s ETW ProcessStart latency. Returns true if `pid` is in the tree
+    // afterwards; false means "not resolvable", i.e. pass the connection
+    // through exactly as before this fallback existed.
+    bool resolve_pid_now(DWORD pid);
+
     // --- Config sync ---
     void apply_auto_rules_from_config(const std::vector<AutoRule>& rules);
 
@@ -97,7 +107,12 @@ public:
 private:
     void notify_tree_changed(std::string_view source, push_urgency urgency);
 
-    void handle_start_or_rundown(const etw_process_event& evt, bool is_rundown);
+    // notify=false suppresses the per-entry UI push. The sync-resolve path uses
+    // it because that push is a full projection refresh + serialize, and it
+    // would otherwise run on the strand *before* the caller gets to write the
+    // PortTracker entry -- delaying the write past the outgoing SYN.
+    void handle_start_or_rundown(const etw_process_event& evt, bool is_rundown,
+                                 bool notify = true);
     void handle_stop(const etw_process_event& evt);
     void handle_lost(const etw_process_event& evt);
     void schedule_rundown_grace();

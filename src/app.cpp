@@ -84,11 +84,17 @@ app::app(const cli_options& opts, HINSTANCE hinstance)
     redirect_port_ = acceptor_.start();
     PC_LOG_INFO("Acceptor listening on port {}", redirect_port_);
 
+    // Both SOCKET layers run on the same strand as the tree manager, so the
+    // fallback resolve is a plain in-line call — no marshalling needed.
+    auto resolve_unknown_pid = [this](DWORD pid) { return tree_mgr_.resolve_pid_now(pid); };
+
     wd_socket_      = std::make_unique<windivert_socket>(ioc_, strand_, tree_mgr_.tree(),
-                                                         tree_mgr_.rules(), *port_tracker_);
+                                                         tree_mgr_.rules(), *port_tracker_,
+                                                         resolve_unknown_pid);
     wd_network_     = std::make_unique<windivert_network>(*port_tracker_, redirect_port_);
     wd_socket_udp_  = std::make_unique<windivert_socket_udp>(ioc_, strand_, tree_mgr_.tree(),
-                                                              tree_mgr_.rules(), *udp_port_tracker_);
+                                                              tree_mgr_.rules(), *udp_port_tracker_,
+                                                              resolve_unknown_pid);
     wd_network_udp_ = std::make_unique<windivert_network_udp>(*udp_port_tracker_, UDP_RELAY_PORT,
                                                                udp_session_table_, policy_pub_);
 

@@ -24,6 +24,7 @@
 #include <cstring>
 #include <format>
 #include <atomic>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 #include "core/log.hpp"
@@ -36,16 +37,22 @@ namespace clew {
 
 class windivert_socket {
 public:
+    // resolve_unknown_pid: called on the strand when a CONNECT event names a
+    // PID the tree doesn't know yet (see process_tree_manager::resolve_pid_now).
+    // Returns true once the PID is in the tree. Leaving it unset restores the
+    // old behavior of passing such connections through as direct.
     windivert_socket(asio::io_context& ioc,
                      asio::strand<asio::io_context::executor_type>& strand,
                      flat_tree& tree,
                      rule_engine_v3& rules,
-                     PortTracker& tracker)
+                     PortTracker& tracker,
+                     std::function<bool(DWORD)> resolve_unknown_pid)
         : ioc_(ioc)
         , strand_(strand)
         , tree_(tree)
         , rules_(rules)
         , tracker_(tracker)
+        , resolve_unknown_pid_(std::move(resolve_unknown_pid))
     {}
 
     ~windivert_socket() { close(); }
@@ -115,6 +122,7 @@ private:
     flat_tree& tree_;
     rule_engine_v3& rules_;
     PortTracker& tracker_;
+    std::function<bool(DWORD)> resolve_unknown_pid_;
 
     HANDLE handle_{INVALID_HANDLE_VALUE};
     bool use_iocp_{true};
@@ -187,7 +195,19 @@ private:
 
         // Lookup in flat tree (strand-safe, no locks)
         uint32_t idx = tree_.find_by_pid(pid);
-        if (idx == INVALID_IDX) return;
+        if (idx == INVALID_IDX) {
+            // Unknown PID: nearly always a process younger than the ~1-2s ETW
+            // ProcessStart latency. It is connecting right now, so it is alive
+            // and can be resolved on the spot. Passing it through instead is
+            // what let fast-spawning children (git, curl, gh) miss their rule
+            // entirely -- they finish connecting before ETW ever announces them.
+            if (!resolve_unknown_pid_ || !resolve_unknown_pid_(pid)) return;
+
+            // The resolve appends to the tree, which can reallocate entries_,
+            // so the lookup has to be redone rather than reusing an old index.
+            idx = tree_.find_by_pid(pid);
+            if (idx == INVALID_IDX) return;
+        }
 
         const auto& entry = tree_.at(idx);
         if (!entry.alive || !entry.is_proxied()) return;

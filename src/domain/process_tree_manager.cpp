@@ -160,7 +160,117 @@ void process_tree_manager::apply_etw_event_on_strand(const etw_process_event& ev
     }
 }
 
-void process_tree_manager::handle_start_or_rundown(const etw_process_event& evt, bool is_rundown) {
+// --- SOCKET-layer fallback ---
+
+bool process_tree_manager::resolve_pid_now(DWORD pid) {
+    if (pid == 0) return false;
+    if (tree_.find_by_pid(pid) != INVALID_IDX) return true;
+
+    // Everything below sits between the app's connect() and the caller writing
+    // the PortTracker entry, and the outgoing SYN is not waiting for us. Every
+    // microsecond spent here is a chance for the connection to escape
+    // unredirected, so the whole path must stay free of anything O(tree).
+    const auto t_begin = std::chrono::steady_clock::now();
+
+    // Walk up from the connecting process, collecting every ancestor the tree
+    // doesn't know yet. The whole chain matters, not just the connecting PID:
+    // git-remote-https.exe inherits its rule from git.exe, which was spawned
+    // only ~200ms earlier and is therefore missing too. Rule inheritance tests
+    // entry.parent_pid against each rule's matched set, so a parent inserted
+    // after its child would leave the child classified as unmatched.
+    static constexpr int kMaxChainDepth = 16;
+    std::vector<live_process_info> chain;  // [0] = the connecting process
+    chain.reserve(4);
+
+    DWORD cursor = pid;
+    for (int depth = 0; depth < kMaxChainDepth; ++depth) {
+        live_process_info info;
+        if (!query_live_process(cursor, info)) break;
+        chain.push_back(std::move(info));
+
+        const DWORD parent = chain.back().parent_pid;
+        if (parent == 0) break;                               // no parent
+        if (tree_.find_by_pid(parent) != INVALID_IDX) break;  // anchored in tree
+        cursor = parent;
+    }
+
+    if (chain.empty()) {
+        // Unopenable: already exited, PPL-protected, or a system pseudo-PID.
+        // Same outcome as before this fallback existed.
+        PC_LOG_DEBUG("[TreeMgr] Sync-resolve failed PID={}", pid);
+        return false;
+    }
+
+    // Parent PSN for the topmost ancestor we resolved.
+    uint64_t    top_parent_psn = ROOT_PSN_SENTINEL;
+    const DWORD top_parent_pid = chain.back().parent_pid;
+    if (top_parent_pid != 0) {
+        live_process_info ancestor;
+        if (query_live_process(top_parent_pid, ancestor)) {
+            // Alive, so its real PSN is authoritative. If the tree has no entry
+            // under that PSN, link_or_orphan parks the child and the parent's
+            // own ETW START drains it later.
+            top_parent_psn = ancestor.psn;
+        } else {
+            // Gone. A tree entry under this PID is trustworthy only if it was
+            // created before our child was -- otherwise the PID was recycled
+            // and that entry belongs to an unrelated process.
+            uint32_t pidx = tree_.find_by_pid(top_parent_pid);
+            if (pidx != INVALID_IDX &&
+                CompareFileTime(&tree_.at(pidx).create_time,
+                                &chain.back().create_time) <= 0) {
+                top_parent_psn = tree_.at(pidx).psn;
+            }
+        }
+    }
+
+    // Insert top-down so every on_process_start sees a parent that is already
+    // present and classified. Reusing handle_start_or_rundown keeps a single
+    // insertion path: idempotency, PID-reuse tombstoning, linkage, orphan
+    // draining, rule matching and the UI push all behave exactly as for ETW.
+    //
+    // The push cost is not new. Each of these processes would have produced the
+    // same immediate push when its ETW START landed ~1.5s later; that START is
+    // now an idempotent no-op, so the total number of pushes is unchanged and
+    // only their timing moves earlier.
+    for (size_t i = chain.size(); i-- > 0;) {
+        const live_process_info& info = chain[i];
+
+        etw_process_event evt{};
+        evt.kind        = etw_process_event_kind::START;
+        evt.pid         = info.pid;
+        evt.psn         = info.psn;
+        evt.parent_pid  = info.parent_pid;
+        evt.parent_psn  = (i + 1 < chain.size()) ? chain[i + 1].psn : top_parent_psn;
+        evt.create_time = info.create_time;
+        evt.image_name  = info.name;
+        evt.received_at = std::chrono::steady_clock::now();
+
+        // notify=false: the UI push is a full projection refresh + serialize of
+        // the whole tree. Running it here, once per inserted ancestor, is what
+        // pushed the tracker write tens of milliseconds past the SYN.
+        handle_start_or_rundown(evt, /*is_rundown=*/false, /*notify=*/false);
+    }
+
+    const uint32_t idx = tree_.find_by_pid(pid);
+    if (idx == INVALID_IDX) return false;
+
+    // Hand the UI one coalesced update, and do it on a later strand turn so the
+    // caller can finish writing the PortTracker entry first.
+    asio::post(strand_, [this]() {
+        notify_tree_changed("sync_resolve", push_urgency::batched);
+    });
+
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - t_begin).count();
+    PC_LOG_INFO("[TreeMgr] Sync-resolved PID={} name='{}' chain={} proxied={} in {}us",
+                pid, tree_.at(idx).name_u8, chain.size(),
+                tree_.at(idx).is_proxied(), elapsed_us);
+    return true;
+}
+
+void process_tree_manager::handle_start_or_rundown(const etw_process_event& evt, bool is_rundown,
+                                                   bool notify) {
     // 1. Idempotency: same (pid, psn) already known -> skip. Common during
     //    capture_state (rundown of a process whose Start we already saw)
     //    and after lost+recovery cycles.
@@ -187,8 +297,10 @@ void process_tree_manager::handle_start_or_rundown(const etw_process_event& evt,
         PC_LOG_INFO("[TreeMgr] Auto-matched: PID={} PSN={} rule='{}' group={}",
                      evt.pid, evt.psn, *matched, tree_.at(new_idx).group_id);
     }
-    notify_tree_changed(is_rundown ? "etw_rundown" : "etw_start",
-                        is_rundown ? push_urgency::batched : push_urgency::immediate);
+    if (notify) {
+        notify_tree_changed(is_rundown ? "etw_rundown" : "etw_start",
+                            is_rundown ? push_urgency::batched : push_urgency::immediate);
+    }
 }
 
 void process_tree_manager::handle_stop(const etw_process_event& evt) {
