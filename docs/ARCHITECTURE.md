@@ -348,9 +348,11 @@ The HTTP handler `process_handlers.cpp::handle_hijack` / `handle_unhijack` no lo
 
 ### PID recycling handling
 
-- Windows recycles PIDs; `th32ParentProcessID` is unreliable
-- ETW `ProcessStop` triggers immediate cleanup of flat_tree entry + PortTracker slot
-- Flat-tree LC-RS pointers updated atomically on process exit
+- Windows recycles PIDs, and ETW delivers `ProcessStop` 1–2 s late (same as `ProcessStart`). Inside that window a new process can carry a PID whose dead owner is still in the tree. A tight spawn loop hits this routinely (measured: 1 in 30 fresh curls, 14 in 200 under a 1000-process storm).
+- The tree's identity is `(pid, psn)` (`ProcessSequenceNumber`, boot-unique): `find_by_pid_psn` for ETW STOP and idempotent START; `add_entry` with a known PID and a different PSN tombstones the old entry first. The hot-path `find_by_pid` (SOCKET handlers) returns the latest owner, so `resolve_pid_now` verifies a known PID against the live PSN before trusting it.
+- **Rule for any state keyed by a bare PID** (added after the second recycled-PID bug, 2026-09-07): it must say how it survives a recycled PID — either key it by `(pid, psn)` / PSN, or reset it on both owner-change hooks: `process_tree_manager::handle_stop` (ETW STOP) *and* the overwrite path in `handle_start_or_rundown` (a different-PSN insert over an existing PID; reached from ETW START and from the synchronous resolve). Today's bare-PID state: `AutoRule::matched_pids` / `excluded_pids` — reset via `rule_engine_v3::on_process_exit` on both hooks. Known residual: tree inheritance tests `matched_pids.contains(parent_pid)`, so a parent PID recycled inside the window lets an unrelated new process's children inherit the rule until the STOP lands; the systematic fix is PSN-keyed rule state (see the deferred list in the project notes).
+- PortTracker slots are not cleaned by ETW at all: `proxied` slots by relay teardown, `direct` / `abandoned` by SOCKET CLOSE, and the kernel-timestamp TTL covers what both miss (see "TCP SYN parking").
+- Flat-tree LC-RS pointers are updated on tombstone; children are reparented to the nearest alive ancestor.
 
 ### Multi-proxy routing via proxy groups
 
