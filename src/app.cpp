@@ -197,6 +197,7 @@ nlohmann::json app::traffic_stats() const {
             {"released_by_watchdog", c.released_by_watchdog},
             {"released_by_drain",    c.released_by_drain},
             {"ttl_stale",            c.ttl_stale},
+            {"retransmit_passed",    c.retransmit_passed},
             {"dup_syn_dropped",      c.dup_syn_dropped},
             {"cas_lost_to_decision", c.cas_lost_to_decision},
             {"pool_exhausted",       c.pool_exhausted},

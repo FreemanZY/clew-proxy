@@ -107,6 +107,7 @@ struct alignas(64) TrackerSlot {
     int64_t      connect_ts{0};   // kernel Timestamp of the CONNECT that produced the decision (strand-owned)
     int64_t      pinned_ts{0};    // kernel Timestamp of the SYN the watchdog released (injector/worker-owned)
     TrackerEntry entry{};
+    std::atomic<uint32_t> syn_seq{0};   // ISN of the last SYN the NETWORK worker handled on this port (worker-owned)
 };
 
 // alignas(64) is the false-sharing defense for the lock-free worker reads;
@@ -174,6 +175,20 @@ public:
         v.connect_ts = s.connect_ts;
         v.pinned_ts  = s.pinned_ts;
         return v;
+    }
+
+    // Remember the ISN of the SYN being handled on this port. Written by the
+    // worker on every SYN it acts on or parks (not on duplicates it drops).
+    void note_syn(uint16_t port, uint32_t seq) {
+        slots_[port].syn_seq.store(seq, std::memory_order_relaxed);
+    }
+
+    // A SYN that repeats the ISN of the last one on this port is the same
+    // connection retransmitting (RTO >= 1s, so it is always past the TTL).
+    // Windows randomises the ISN per connection, so a genuinely new flow on
+    // the reused port carries a different one and takes the TTL path.
+    bool is_retransmit(uint16_t port, uint32_t seq) const {
+        return slots_[port].syn_seq.load(std::memory_order_relaxed) == seq;
     }
 
     // The worker's only transition: `expected` -> pending(gen, idx). Fails when

@@ -120,17 +120,29 @@ private:
 
     // Outbound SYN (no ACK) with SYN parking on. Everything here is the
     // NETWORK side of docs/ARCHITECTURE.md "SYN parking".
-    void handle_syn(uint8_t* pkt_buf, UINT pkt_len, uint16_t src_port, WINDIVERT_ADDRESS* addr) {
+    void handle_syn(uint8_t* pkt_buf, UINT pkt_len, uint32_t seq,
+                    uint16_t src_port, WINDIVERT_ADDRESS* addr) {
         auto v = tracker_.load(src_port);
         auto st = v.state();
 
         if (st == slot_state::proxied || st == slot_state::direct || st == slot_state::abandoned) {
             // Item 21: a decision is only ours if it is younger than the TTL,
             // measured on the kernel clock at both ends. Older means a
-            // leftover from a previous flow on this port (or a retransmitted
-            // SYN >= 1s later): treat the slot as empty and park.
+            // leftover from a previous flow on this port: treat the slot as
+            // empty and park.
             const int64_t ref = (st == slot_state::abandoned) ? v.pinned_ts : v.connect_ts;
             if (addr->Timestamp - ref <= ttl_ticks_) {
+                tracker_.note_syn(src_port, seq);
+                act(st, pkt_buf, pkt_len, addr);
+                return;
+            }
+            // The one legitimate way to be past the TTL on the same flow: a
+            // retransmitted SYN (same ISN). Act on the state we already
+            // hold; parking it would only add T and a watchdog count for a
+            // packet that is already >= 1s late. A different ISN on the same
+            // port is a new connection and takes the park path below.
+            if (tracker_.is_retransmit(src_port, seq)) {
+                parker_->note_retransmit();
                 act(st, pkt_buf, pkt_len, addr);
                 return;
             }
@@ -141,6 +153,8 @@ private:
             parker_->note_dup_syn();
             return;
         }
+
+        tracker_.note_syn(src_port, seq);
 
         // Park (item 5: full copy of packet + address).
         if (pkt_len > syn_parker::MAX_PACKET) {
@@ -210,7 +224,7 @@ private:
             // later segment of a flow we never claimed passes through.
             const bool is_syn = tcp->Syn && !tcp->Ack;
             if (is_syn && parker_) {
-                handle_syn(pkt_buf, pkt_len, src_port, &addr);
+                handle_syn(pkt_buf, pkt_len, ntohl(tcp->SeqNum), src_port, &addr);
                 continue;
             }
 

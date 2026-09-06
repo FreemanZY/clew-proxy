@@ -87,6 +87,7 @@ struct syn_parking_counters {
     uint64_t released_by_watchdog = 0;  // item 7, counter 1
     uint64_t released_by_drain    = 0;  // shutdown
     uint64_t ttl_stale            = 0;  // SYN found a decision older than the TTL -> parked anyway
+    uint64_t retransmit_passed    = 0;  // past the TTL but same ISN: acted on the held state, not parked
     uint64_t dup_syn_dropped      = 0;  // second SYN while pending (item 19 path 5)
     uint64_t cas_lost_to_decision = 0;  // decision landed between the worker's load and its CAS
     uint64_t pool_exhausted       = 0;  // item 8: passed + pinned abandoned instead of parked
@@ -185,6 +186,7 @@ public:
     // Counters the worker bumps directly.
     void note_parked()          { bump(parked_); }
     void note_ttl_stale()       { bump(ttl_stale_); }
+    void note_retransmit()      { bump(retransmit_passed_); }
     void note_dup_syn()         { bump(dup_syn_dropped_); }
     void note_cas_lost()        { bump(cas_lost_to_decision_); }
     void note_oversize()        { bump(oversize_); }
@@ -217,6 +219,7 @@ public:
         c.released_by_watchdog = released_by_watchdog_.load();
         c.released_by_drain    = released_by_drain_.load();
         c.ttl_stale            = ttl_stale_.load();
+        c.retransmit_passed    = retransmit_passed_.load();
         c.dup_syn_dropped      = dup_syn_dropped_.load();
         c.cas_lost_to_decision = cas_lost_to_decision_.load();
         c.pool_exhausted       = pool_exhausted_.load();
@@ -273,7 +276,7 @@ private:
     std::jthread      injector_;
 
     std::atomic<uint64_t> parked_{0}, released_by_decision_{0}, released_by_watchdog_{0},
-                          released_by_drain_{0}, ttl_stale_{0}, dup_syn_dropped_{0},
+                          released_by_drain_{0}, ttl_stale_{0}, retransmit_passed_{0}, dup_syn_dropped_{0},
                           cas_lost_to_decision_{0}, pool_exhausted_{0}, oversize_{0},
                           gen_mismatch_{0}, send_failures_{0}, park_us_max_{0}, park_us_sum_{0};
 

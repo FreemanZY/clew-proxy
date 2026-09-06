@@ -795,6 +795,27 @@ TEST(port_tracker_close_state_machine) {
     ASSERT_FALSE(pt->on_close(7015, 1).has_value());
 }
 
+TEST(port_tracker_isn_retransmit_vs_new_flow) {
+    auto pt = std::make_unique<PortTracker>();
+    // A direct flow on port 7020 whose SYN carried ISN 0xAABBCCDD
+    pt->publish(7020, slot_state::direct, make_entry(1, 443, 0), 1000);
+    pt->note_syn(7020, 0xAABBCCDDu);
+
+    // Same ISN again (retransmit, >= 1s later so far past the TTL): recognised
+    ASSERT_TRUE(pt->is_retransmit(7020, 0xAABBCCDDu));
+    // Different ISN on the same port and remote: a new connection, must NOT
+    // be swallowed by the retransmit exception -> takes the TTL/park path
+    ASSERT_FALSE(pt->is_retransmit(7020, 0xAABBCCDEu));
+    // Nothing recorded on a port we never saw a SYN on
+    ASSERT_FALSE(pt->is_retransmit(7021, 0xAABBCCDDu));
+
+    // The new flow's SYN replaces the recorded ISN; the old one no longer matches
+    pt->note_syn(7020, 0x11223344u);
+    ASSERT_FALSE(pt->is_retransmit(7020, 0xAABBCCDDu));
+    ASSERT_TRUE(pt->is_retransmit(7020, 0x11223344u));
+    ASSERT_EQ(sizeof(clew::TrackerSlot), (size_t)64);
+}
+
 TEST(port_tracker_word_packing) {
     using clew::pack_word; using clew::word_state; using clew::word_gen; using clew::word_idx;
     const uint64_t w = pack_word(slot_state::pending, 0xABCDEFu, 123456789u);
