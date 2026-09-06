@@ -71,9 +71,10 @@ src/
     log.hpp                          - quill wrapper, PC_LOG_* macros + runtime set_log_level
     scoped_exit.hpp                  - unique_handle (Win32 HANDLE RAII) + scoped_exit<F>
     string_hash.hpp                  - transparent string_hash + string_map<V> alias
-    port_tracker.hpp                 - atomic array[65536] mapping local port -> tracker entry
-    windivert_socket.hpp             - TCP SOCKET SNIFF: intercepts connect(), writes PortTracker
-    windivert_network.hpp            - TCP NETWORK reflection: reads PortTracker, redirects
+    port_tracker.hpp                 - atomic array[65536]: per local port, a four-state word {state|gen|pool idx} + timestamps + entry
+    syn_parker.hpp                   - SYN parking: bounded packet pool + injector thread (release / watchdog sweep)
+    windivert_socket.hpp             - TCP SOCKET SNIFF: CONNECT -> one published decision (proxied/direct), CLOSE -> slot cleanup
+    windivert_network.hpp            - TCP NETWORK reflection: parks undecided SYNs, reflects proxied flows
     dns_forwarder.hpp                - UDP DNS listener, forwards via SOCKS5 UDP ASSOCIATE
     dns_manager.hpp                  - dns_forwarder lifecycle + system DNS state
     system_dns.hpp                   - Win32 SetInterfaceDnsSettings + dns_state.json persist
@@ -187,24 +188,26 @@ nothing on the frontend needs to fetch the full tree any more. `/api/processes/:
 and `/api/processes/:pid/detail` are kept because they answer single-record
 questions that the push channel does not duplicate.
 
-#### Coalescing — opt-in compile switch (`CLEW_PROJECTION_COALESCE`)
+#### Coalescing — compile switch `CLEW_PROJECTION_COALESCE`, ON since v0.10
 
-Default build does **no** coalescing — every ETW event triggers an immediate
-refresh + push. Snappy at any normal tree size: `process_tree_to_json_string`
-costs ~2 µs per process, ETW arrival rate on a quiet box is typically <30/sec,
-so strand utilisation stays under 1% even with 1000 live processes.
+A 100 ms refresh-coalesce window for `batched` urgency: the refresh happens
+**inside** the timer callback, not per event, so a burst of hundreds of ETW
+events collapses to a single refresh + push at the end of the window.
+`immediate` urgency (user-driven: hijack, rules, exclusions) bypasses the
+timer regardless. Since v0.10 **all** ETW-driven changes are `batched`,
+including `etw_start` (it used to be `immediate`).
 
-`cmake -DCLEW_PROJECTION_COALESCE=ON` enables a 100 ms refresh-coalesce
-window for `batched` urgency. The fix-it-properly version (refresh **inside**
-the timer callback, not per-event) is what's compiled in — bursts of hundreds
-of ETW events collapse to a single refresh + push at the end of the window.
-`immediate` urgency (user-driven) still bypasses the timer regardless.
-
-When to enable: only if a real workload generates sudden +1000-process
-bursts (large parallel build, runaway spawn) where the strand budget matters.
-The trade-off is up to 100 ms of tree-update lag for batched events. For
-characterisation use `tests/stress_etw.py` + `tests/stress_backend.py` (see
-the "Build notes" section).
+Why it is no longer optional: with SYN parking, CONNECT decisions run on the
+same strand, and a decision that waits more than the parking watchdog (20 ms)
+lets a connection go direct. ETW delivers a spawn loop's starts and stops
+1–2 s later as one burst; measured, that burst of per-event refreshes
+(~0.8 ms each for ~450 processes) held a decision past the watchdog once in
+100 fresh connections. The trade-off — a new process shows up in the tree
+up to 100 ms later — is not perceptible. The option is kept for
+experiments (`cmake -DCLEW_PROJECTION_COALESCE=OFF`) but `CMakePresets.json`
+pins it ON; an old `build/` cache keeps whatever it had, so reconfigure via
+the preset. For characterisation use `tests/stress_etw.py` +
+`tests/stress_backend.py` (see the "Build notes" section).
 
 ### Visibility gate — minimize / tray drops backend work
 
@@ -277,15 +280,43 @@ diagnosis trail.
 
 ### WinDivert dual-layer
 
-- **SOCKET SNIFF layer** (`windivert_socket.hpp`): intercepts `connect()` via WinDivert SOCKET layer. Reads `flat_tree[pid].group_id` directly (O(1)). If hijacked, writes `{pid, group_id}` into `PortTracker[local_port]`. Runs via strand posting.
-- **NETWORK reflection layer** (`windivert_network.hpp`): reads `PortTracker[src_port]`. If match: `swap(SrcAddr,DstAddr)` + `DstPort = redirect_port` + `Outbound = 0` (inbound reinject, streamdump pattern). Filter: `outbound and tcp and !loopback`. Runs in two dedicated blocking threads.
+- **SOCKET SNIFF layer** (`windivert_socket.hpp`): observes `connect()` and `close()` events (filter `outbound and !loopback and tcp and (event == CONNECT or event == CLOSE)`). For every CONNECT it publishes exactly one decision into `PortTracker[local_port]`: `proxied(group)` or `direct`. Unknown PIDs (younger than the ~1–2 s ETW delivery) are resolved on the spot by `process_tree_manager::resolve_pid_now` (ancestor walk + insert with the real PSN, so the late ETW START is an idempotent no-op). Handler runs on the strand.
+- **NETWORK reflection layer** (`windivert_network.hpp`): filter `outbound and tcp and !loopback`, opened with `flags = 0` — WinDivert's divert mode, so every matched packet is held until we `WinDivertSend` it. Reads `PortTracker[src_port]`. `proxied` → `swap(SrcAddr,DstAddr)` + `DstPort = redirect_port` + `Outbound = 0` (inbound reinject, streamdump pattern). Initial SYNs without a decision are **parked** (next section). Two dedicated blocking worker threads.
+- WinDivert's layer split is the reason for both layers: NETWORK can block/inject but has no PID; SOCKET has the PID but cannot touch packets. The local port is the only key they share.
+
+### TCP SYN parking (v0.10)
+
+Why: the kernel emits the SOCKET CONNECT event *before* the SYN (0 violations in 58, lead p50 17.6 µs), but our SOCKET and NETWORK pipelines are two independent async paths of comparable latency. Before parking, the NETWORK worker released a SYN whose port had no decision yet — which for a freshly spawned process (git, curl, gh: connect ~150 ms after birth, ETW announces it 1–2 s later) was *every* first connection. Measured interception rate for fresh `git ls-remote`: **0/30**. Design record: memory `project/syn_parking/`; PoC + numbers: `win_prox/tools/poc/poc_syn_parking_report.md`.
+
+How:
+
+1. NETWORK worker sees an outbound `SYN && !ACK` whose slot has no usable decision → copies packet + `WINDIVERT_ADDRESS` into a bounded pool (`syn_parker.hpp`, 256 × 2 KB) and CASes the slot `empty → pending(gen, idx)`. The worker keeps receiving; nothing blocks.
+2. SOCKET handler (strand) decides and calls `PortTracker::publish`. If the slot is `pending`, the CAS `pending → proxied|direct` transfers ownership of the pool index to the strand, which hands it to the **injector thread**.
+3. Injector copies the packet out, frees the pool slot, then sends: verbatim for `direct`, reflected for `proxied`. (`WinDivertSend` is 47–190 µs; the strand only publishes.)
+4. **Watchdog**: the injector wakes every 1 ms (`CreateWaitableTimerEx` + `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`; a plain 1 ms wait is quantised to the 15.6 ms tick) and releases anything parked longer than `watchdog_ms` (20, cap 50) unchanged, pinning the port `abandoned` with the SYN's kernel timestamp. A decision that arrives later for that flow is **rejected** (`late_rejected`) rather than applied mid-flow — reflecting an established direct connection is exactly the breakage this removes. Normal park times are < 1 ms; 4.7 ms was the worst seen under a 300-connection burst with zero watchdog fires.
+
+Rules that keep it correct (numbers are the design-record item ids):
+
+- **Four states** `empty / pending / proxied / direct / abandoned` packed as `{state:8 | gen:24 | idx:32}` in one atomic word; every transition is a CAS, the CAS winner owns the pool index (17, 18, 22). Strand does all publishes and clears; workers only `empty → pending`; the watchdog only `pending → abandoned`.
+- **Kernel-timestamp TTL** (21): a SYN acts on a slot's decision only if `SYN.Timestamp − slot.connect_ts ≤ 10 ms` (same QPC clock at both layers); older is treated as empty and parks. Retransmitted SYNs of direct flows (RTO ≥ 1 s) therefore park once and are watchdog-released — documented, harmless, do not "fix".
+- **Every CONNECT publishes** (2): resolve failure, not-proxied, CIDR-excluded all publish `direct`. So `pending` has one cause: the event never arrived.
+- **Phantom CONNECT** (24): each re-injected SYN produces a second CONNECT for the same flow (`ProcessId = 4`, ~60–880 µs later). `PortTracker::is_echo` (same remote, decision younger than the TTL) drops it before any tree lookup.
+- **CLOSE fires at `closesocket()`** (25), before the wire is done. CLOSE clears `direct` / `abandoned` / `pending` (parked SYN dropped, pool slot returned); `proxied` slots are cleared only by relay teardown, which posts `clear_if(port, connect_ts)` to the strand (23) — an unconditional off-strand clear could wipe a newer flow that reused the port after a passive close.
+- **Never proxy self** (10): the SOCKET filter no longer excludes our PID (an unobserved self connection would park for the whole watchdog); instead `windivert_socket::decide` returns `direct` for `GetCurrentProcessId()` before consulting any rule, so `*.exe`-style rules cannot loop upstream connections. Only matters for non-loopback proxies — with a `127.0.0.1` proxy `!loopback` already keeps self out.
+- **Pool full → pass + pin** (8), never evict; a duplicate SYN while `pending` is dropped without allocating (19). The leak signal is `pool_in_use` not returning to 0 between bursts (12).
+- **Kill switch** `tcp_syn_parking.enabled = false` (14): no pool, no injector thread, no synchronous PID resolve, SOCKET publishes only `proxied`, NETWORK passes every undecided SYN — the pre-v0.10 code paths, for when the new code itself is what broke. Resolve and parking are a pair: resolve without parking publishes the decision ~100 µs after the SYN left, mid-flow, and the NETWORK layer then reflects an established direct connection (measured: 20/20 TLS timeouts). Startup-only; logged as `[SYN-PARK] enabled/disabled`.
+- **PID recycling at connect time**: ETW STOP is delivered as late as START, so a spawn loop hands a new process a PID whose dead predecessor is still in the tree (seen 1 in 30). `resolve_pid_now` therefore verifies every known PID against the live PSN (one `OpenProcess` + `NtQueryInformationProcess`, ~10–30 µs) and re-resolves on mismatch; the insert tombstones the stale entry and the late STOP becomes a no-op.
+- **UDP is unchanged** (11): per-packet policy table since v0.9.5; the BIND/CONNECT → first datagram lead is 5–10× TCP's and a miss costs one datagram.
+- Build: `CLEW_PROJECTION_COALESCE` is now ON (option default + `CMakePresets.json`). `resolve_pid_now` triggers a tree change on the strand; without coalescing that is an immediate full refresh + ~35 KB serialize, which would hold the next CONNECT decisions past the watchdog. If you reuse an old `build/` cache, reconfigure via the preset.
+
+Counters (`GET /api/stats` → `tcp_syn_parking`, and a `[SYN-PARK]` INFO line every 60 s when they change): `parking.released_by_watchdog` and `socket.late_rejected_proxied` are the two that mean "proxy missed a flow"; `parking.pool_in_use` must drop back to 0; `gen_mismatch`, `oversize`, `send_failures` must stay 0.
 
 ### PortTracker
 
-- `std::array<TrackerSlot, 65536>` with each slot `atomic<bool> active` + `TrackerEntry{remote_addr, remote_port, group_id}`
-- `alignas(64)` per slot to avoid false sharing (~4 MB heap)
-- release/acquire semantics: SOCKET handler writes (strand), NETWORK workers read (blocking threads)
-- Entries persist for connection lifetime, cleared on relay close
+- `std::array<TrackerSlot, 65536>`, each slot one 64-byte line: `atomic<uint64_t> word` (state / generation / pool index) + `connect_ts` (kernel timestamp of the CONNECT) + `pinned_ts` (kernel timestamp of the SYN the watchdog released) + `TrackerEntry{remote_addr, remote_port, group_id}` (~4 MB heap)
+- `alignas(64)` per slot to avoid false sharing; `TrackerEntry` must stay trivially copyable (static_assert — PR #1's shared_ptr-in-slot was UB)
+- Auxiliary fields are written before the release-CAS and read after an acquire load; each state reads only its own aux fields, so a writer that loses its CAS clobbers nothing that matters
+- `proxied` entries persist for the connection lifetime and are cleared by the relay via `clear_if` on the strand; `direct` / `abandoned` by the SOCKET CLOSE event; the TTL covers whatever both miss
 
 ### C++20 coroutine relay
 
@@ -429,9 +460,12 @@ Push events (delivered via `WM_PUSH_TO_FRONTEND` → `PostWebMessageAsJson`,
     "upstream_port": 53,
     "listen_host": "127.0.0.2",
     "listen_port": 53
-  }
+  },
+  "tcp_syn_parking": { "enabled": true, "watchdog_ms": 20, "pool_size": 256 }
 }
 ```
+
+`tcp_syn_parking` is read at startup only. `enabled: false` is the kill switch (see "TCP SYN parking"); `watchdog_ms` is clamped to 5–50 and `pool_size` to 32–4096.
 
 ## Build
 
