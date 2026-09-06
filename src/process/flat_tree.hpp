@@ -284,6 +284,16 @@ inline bool query_live_process(DWORD pid, live_process_info& out) {
     return true;
 }
 
+// Just the identity: the live process's PSN, or INVALID_PSN when the process
+// cannot be opened. One OpenProcess + one NtQuery, ~10-30us. Used to tell a
+// tree entry from a recycled PID whose previous owner's ETW STOP has not
+// arrived yet (STOP is delivered 1-2s late, like START).
+inline uint64_t query_live_psn(DWORD pid) {
+    auto h = wrap_handle(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!h) return INVALID_PSN;
+    return query_process_psn(h.get());
+}
+
 // Side-map value: index into entries_ + PSN tag for disambiguation.
 struct side_entry {
     uint32_t index;

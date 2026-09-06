@@ -164,7 +164,20 @@ void process_tree_manager::apply_etw_event_on_strand(const etw_process_event& ev
 
 bool process_tree_manager::resolve_pid_now(DWORD pid) {
     if (pid == 0) return false;
-    if (tree_.find_by_pid(pid) != INVALID_IDX) return true;
+    if (const uint32_t known = tree_.find_by_pid(pid); known != INVALID_IDX) {
+        // Known PID, but is it the same process? ETW STOP arrives 1-2s late,
+        // and a tight spawn loop recycles PIDs faster than that (seen: 1 in 30
+        // fresh curls landed on a dead predecessor's entry and went direct).
+        // One OpenProcess + PSN read per CONNECT settles it; when the process
+        // cannot be opened we keep the entry we have.
+        const uint64_t live_psn = query_live_psn(pid);
+        if (live_psn == INVALID_PSN || live_psn == tree_.at(known).psn) return true;
+        PC_LOG_INFO("[TreeMgr] PID {} recycled before its ETW STOP arrived "
+                    "(tree PSN={}, live PSN={}); re-resolving",
+                    pid, tree_.at(known).psn, live_psn);
+        // Fall through: the insert below tombstones the stale entry
+        // (add_entry: same PID, different PSN).
+    }
 
     // Everything below sits between the app's connect() and the caller writing
     // the PortTracker entry, and the outgoing SYN is not waiting for us. Every
@@ -280,6 +293,15 @@ void process_tree_manager::handle_start_or_rundown(const etw_process_event& evt,
 
     // 2. add_entry handles PID-reuse internally: if pid exists with a
     //    different PSN, it tombstones the old before installing new.
+    //    The rule engine must forget the old owner first: it keys match
+    //    state by PID, and try_match_one skips a PID it already holds, so
+    //    the recycled PID would otherwise inherit "already matched" without
+    //    ever being marked proxied (seen under a 1000-process storm: 14 of
+    //    200 fresh curls). ETW STOP does the same via handle_stop; here the
+    //    STOP simply has not arrived yet.
+    if (tree_.find_by_pid(evt.pid) != INVALID_IDX) {
+        rules_.on_process_exit(evt.pid);
+    }
     uint32_t new_idx = tree_.add_entry(evt.pid, evt.parent_pid,
                                        evt.psn, evt.parent_psn,
                                        evt.create_time,
@@ -298,8 +320,14 @@ void process_tree_manager::handle_start_or_rundown(const etw_process_event& evt,
                      evt.pid, evt.psn, *matched, tree_.at(new_idx).group_id);
     }
     if (notify) {
+        // Batched, not immediate: ETW delivers starts in bursts (a spawn loop's
+        // events all land 1-2s later, together with their stops), and each
+        // immediate push is a full refresh + ~40KB serialize on this strand.
+        // Measured: a burst of those held a CONNECT decision past the 20ms
+        // SYN-parking watchdog. Users see a new process ~100ms later; user
+        // actions (hijack, rules) still push immediately.
         notify_tree_changed(is_rundown ? "etw_rundown" : "etw_start",
-                            is_rundown ? push_urgency::batched : push_urgency::immediate);
+                            push_urgency::batched);
     }
 }
 

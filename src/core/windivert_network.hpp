@@ -30,15 +30,22 @@
 #include "core/log.hpp"
 
 #include "core/port_tracker.hpp"
+#include "core/syn_parker.hpp"
 
 namespace clew {
 
 class windivert_network {
 public:
-    windivert_network(PortTracker& tracker, uint16_t redirect_port)
+    // parker: SYN-parking pool/injector, or nullptr to keep the pre-parking
+    // behavior (every SYN without a decision passes through unchanged).
+    windivert_network(PortTracker& tracker, uint16_t redirect_port, syn_parker* parker = nullptr)
         : tracker_(tracker)
         , redirect_port_(redirect_port)
+        , parker_(parker)
+        , ttl_ticks_(tracker.ttl_ticks())
     {}
+
+    HANDLE handle() const { return handle_; }
 
     ~windivert_network() { close(); }
 
@@ -87,12 +94,77 @@ public:
 private:
     PortTracker& tracker_;
     uint16_t redirect_port_;
+    syn_parker* parker_;
+    int64_t ttl_ticks_;
     HANDLE handle_{INVALID_HANDLE_VALUE};
     std::atomic<bool> running_{false};
     std::vector<std::jthread> workers_;
 
     std::atomic<uint64_t> nat_count_{0};
     std::atomic<uint64_t> pass_count_{0};
+
+    void passthrough(uint8_t* pkt_buf, UINT pkt_len, WINDIVERT_ADDRESS* addr) {
+        WinDivertSend(handle_, pkt_buf, pkt_len, nullptr, addr);
+        pass_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Act on a decided slot state for this SYN.
+    void act(slot_state st, uint8_t* pkt_buf, UINT pkt_len, WINDIVERT_ADDRESS* addr) {
+        if (st == slot_state::proxied) {
+            reflect_outbound_packet(handle_, pkt_buf, pkt_len, addr, redirect_port_);
+            nat_count_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            passthrough(pkt_buf, pkt_len, addr);
+        }
+    }
+
+    // Outbound SYN (no ACK) with SYN parking on. Everything here is the
+    // NETWORK side of docs/ARCHITECTURE.md "SYN parking".
+    void handle_syn(uint8_t* pkt_buf, UINT pkt_len, uint16_t src_port, WINDIVERT_ADDRESS* addr) {
+        auto v = tracker_.load(src_port);
+        auto st = v.state();
+
+        if (st == slot_state::proxied || st == slot_state::direct || st == slot_state::abandoned) {
+            // Item 21: a decision is only ours if it is younger than the TTL,
+            // measured on the kernel clock at both ends. Older means a
+            // leftover from a previous flow on this port (or a retransmitted
+            // SYN >= 1s later): treat the slot as empty and park.
+            const int64_t ref = (st == slot_state::abandoned) ? v.pinned_ts : v.connect_ts;
+            if (addr->Timestamp - ref <= ttl_ticks_) {
+                act(st, pkt_buf, pkt_len, addr);
+                return;
+            }
+            parker_->note_ttl_stale();
+        } else if (st == slot_state::pending) {
+            // Item 19 path 5: the slot holds one pool index; a second SYN
+            // must not allocate another. The parked one covers this flow.
+            parker_->note_dup_syn();
+            return;
+        }
+
+        // Park (item 5: full copy of packet + address).
+        if (pkt_len > syn_parker::MAX_PACKET) {
+            parker_->note_oversize();
+            passthrough(pkt_buf, pkt_len, addr);
+            return;
+        }
+        const parked_ref ref = parker_->park(pkt_buf, pkt_len, *addr, src_port);
+        if (ref.idx == NO_POOL_IDX) {
+            // Item 8: controlled failure. Pass + pin, never evict.
+            parker_->note_pool_exhausted();
+            tracker_.pin_abandoned(src_port, v.word, addr->Timestamp);
+            passthrough(pkt_buf, pkt_len, addr);
+            return;
+        }
+        if (tracker_.try_park(src_port, v.word, ref.gen, ref.idx)) {
+            parker_->note_parked();
+            return;   // the injector sends it once the decision lands
+        }
+        // A decision landed between our load and our CAS: act on it now.
+        parker_->note_cas_lost();
+        parker_->free_slot(ref.idx);
+        act(tracker_.load(src_port).state(), pkt_buf, pkt_len, addr);
+    }
 
     void worker_loop(std::stop_token st) {
         // Stack-allocated buffers per worker, zero heap allocation
@@ -124,62 +196,34 @@ private:
             uint16_t src_port = ntohs(tcp->SrcPort);
             uint16_t dst_port = ntohs(tcp->DstPort);
 
-            // === Hot path: check if this connection is tracked ===
-            // Outbound from tracked app: src_port is the app's ephemeral port
-            if (tracker_.should_reflect(src_port)) {
-                // Cold path: NAT rewrite (Reflection)
-                reflect_outbound(pkt_buf, pkt_len, ip, tcp, src_port, &addr);
-                nat_count_.fetch_add(1, std::memory_order_relaxed);
-            }
-            // Outbound proxy reply: the relay sent data to the original destination IP
-            // In Reflection mode, this appears as outbound to the original dest.
-            // We need to check if dst_port matches any tracked connection's remote_port.
-            // Actually, the reply from the listener goes to the original dest IP:port,
-            // so it shows as outbound. The src_port is the listener's ephemeral port
-            // to the upstream proxy. But wait — the relay connects to the SOCKS5 proxy,
-            // not to the original destination. So the reply path is different.
-            //
-            // In Reflection: after the initial SYN is reflected inbound, the TCP handshake
-            // completes with the listener. Subsequent data from the app is ALSO outbound
-            // to the original dest (kernel still thinks it's connected to orig dest).
-            // All these packets have src_port = app's port, which IS in the tracker.
-            //
-            // Reply from listener → app: the listener sends to orig_dest_ip:orig_dest_port
-            // as the TCP peer. In Reflection mode, this is also outbound non-loopback.
-            // The src_port is the redirect_port.
-            else if (src_port == redirect_port_) {
-                // Reply from local listener — reflect back to app
+            // Reply from the local listener -> app. The listener sends to
+            // orig_dest_ip:app_port as the TCP peer; in Reflection mode that
+            // is also outbound non-loopback, with src_port == redirect_port.
+            if (src_port == redirect_port_) {
                 reflect_reply(pkt_buf, pkt_len, ip, tcp, dst_port, &addr);
                 nat_count_.fetch_add(1, std::memory_order_relaxed);
+                continue;
             }
-            else {
-                // Passthrough: not a tracked connection
-                WinDivertSend(handle_, pkt_buf, pkt_len, nullptr, &addr);
-                pass_count_.fetch_add(1, std::memory_order_relaxed);
+
+            // Item 4: only the initial SYN can be parked. Outbound SYN+ACK
+            // exists too (our acceptor and HTTP API listen), and every
+            // later segment of a flow we never claimed passes through.
+            const bool is_syn = tcp->Syn && !tcp->Ack;
+            if (is_syn && parker_) {
+                handle_syn(pkt_buf, pkt_len, src_port, &addr);
+                continue;
             }
-        }
-    }
 
-    // Reflection forward: app → original_dest becomes inbound to listener
-    void reflect_outbound(uint8_t* pkt_buf, UINT pkt_len,
-                          PWINDIVERT_IPHDR ip, PWINDIVERT_TCPHDR tcp,
-                          uint16_t src_port, WINDIVERT_ADDRESS* addr)
-    {
-        // Swap src/dst addresses
-        uint32_t tmp = ip->SrcAddr;
-        ip->SrcAddr = ip->DstAddr;
-        ip->DstAddr = tmp;
-
-        // Set DstPort to redirect port (listener)
-        tcp->DstPort = htons(redirect_port_);
-
-        // Reinject as inbound (Reflection pattern)
-        addr->Outbound = 0;
-
-        WinDivertHelperCalcChecksums(pkt_buf, pkt_len, addr, 0);
-
-        if (!WinDivertSend(handle_, pkt_buf, pkt_len, nullptr, addr)) {
-            PC_LOG_ERROR("[WD-NETWORK] Send (reflect out) failed: {}", GetLastError());
+            // Non-SYN (or parking off): the pre-parking hot path. After the
+            // SYN is reflected, the app's later segments are still outbound to
+            // the original destination (the kernel still thinks it is
+            // connected there); their src_port is the app's port.
+            if (tracker_.should_reflect(src_port)) {
+                reflect_outbound_packet(handle_, pkt_buf, pkt_len, &addr, redirect_port_);
+                nat_count_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                passthrough(pkt_buf, pkt_len, &addr);
+            }
         }
     }
 

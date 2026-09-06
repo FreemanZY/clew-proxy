@@ -56,13 +56,13 @@ endif()
 # Option to enable WebView2 GUI support
 option(CLEW_ENABLE_WEBVIEW2 "Enable WebView2 GUI support" OFF)
 
-# Optional 100ms refresh-coalesce window in process_projection.
-# Default OFF — the strand cost of refresh-per-event at typical loads
-# (a few hundred to a few thousand processes, low ETW churn) is
-# negligible, and instant pushes feel snappier. Enable only if you
-# have a real workload where ETW bursts (e.g. parallel build kicks
-# off thousands of children at once) saturate the strand.
-option(CLEW_PROJECTION_COALESCE "Enable projection coalesce window (100ms)" OFF)
+# 100ms refresh-coalesce window in process_projection for batched events.
+# Default ON since SYN parking: the SOCKET handler resolves unknown PIDs
+# synchronously on the strand and the tree change that follows must not
+# turn into an immediate full refresh + push (~35KB serialize on the
+# strand) — that would hold up the next CONNECT decisions past the
+# parking watchdog. User-driven changes still push immediately.
+option(CLEW_PROJECTION_COALESCE "Enable projection coalesce window (100ms)" ON)
 
 # ============================================================
 # Dependencies (vcpkg)

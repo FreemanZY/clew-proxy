@@ -11,15 +11,18 @@
 
 namespace clew {
 
-stats_service::stats_service(strand_bound_manager& exec) : exec_(exec) {}
+stats_service::stats_service(strand_bound_manager& exec, std::function<nlohmann::json()> traffic)
+    : exec_(exec), traffic_(std::move(traffic)) {}
 
 nlohmann::json stats_service::get_stats() const {
-    return exec_.query([](const domain::process_tree_manager& m) -> nlohmann::json {
-        nlohmann::json j;
-        j["hijacked_pids"]    = m.rules().get_hijacked_pids(m.tree()).size();
-        j["auto_rules_count"] = m.rules().auto_rules().size();
-        return j;
+    auto j = exec_.query([](const domain::process_tree_manager& m) -> nlohmann::json {
+        nlohmann::json out;
+        out["hijacked_pids"]    = m.rules().get_hijacked_pids(m.tree()).size();
+        out["auto_rules_count"] = m.rules().auto_rules().size();
+        return out;
     });
+    if (traffic_) j["tcp_syn_parking"] = traffic_();
+    return j;
 }
 
 nlohmann::json stats_service::get_env() {

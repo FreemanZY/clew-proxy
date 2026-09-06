@@ -30,6 +30,7 @@
 #include "config/config_store.hpp"
 #include "core/dns_manager.hpp"
 #include "core/port_tracker.hpp"
+#include "core/syn_parker.hpp"
 #include "core/windivert_network.hpp"
 #include "core/windivert_socket.hpp"
 #include "domain/process_tree_manager.hpp"
@@ -95,6 +96,8 @@ private:
     void                                           sync_groups();
     [[nodiscard]] std::pair<std::string, uint16_t> pick_proxy_endpoint() const;
     [[nodiscard]] std::unique_ptr<webview_app>     create_gui();
+    // SOCKET-layer + SYN-parking counters for /api/stats (called off-strand).
+    [[nodiscard]] nlohmann::json                   traffic_stats() const;
 
     static constexpr int      API_PORT       = 18080;
     static constexpr uint16_t UDP_RELAY_PORT = 19999;
@@ -123,6 +126,7 @@ private:
     DnsManager                                        dns_mgr_;
     async_acceptor                                    acceptor_;
     uint16_t                                          redirect_port_ = 0;
+    std::unique_ptr<syn_parker>                       parker_;      // null when tcp_syn_parking.enabled=false
     std::unique_ptr<windivert_socket>                 wd_socket_;
     std::unique_ptr<windivert_network>                wd_network_;
 

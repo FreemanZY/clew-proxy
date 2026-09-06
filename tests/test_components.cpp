@@ -4,9 +4,13 @@
 //
 // Build (VS2022 dev prompt):
 //   cl /EHsc /std:c++latest /utf-8 /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 /DNOMINMAX ^
-//      /I../src /I"%VCPKG_ROOT%/installed/x64-windows/include" ^
+//      /I../src /I../WinDivert-2.2.2-A/include /I"%VCPKG_ROOT%/installed/x64-windows/include" ^
 //      test_components.cpp ^
-//      /link /LIBPATH:"%VCPKG_ROOT%/installed/x64-windows/lib" ws2_32.lib
+//      /link /LIBPATH:"%VCPKG_ROOT%/installed/x64-windows/lib" /LIBPATH:../WinDivert-2.2.2-A/x64 ^
+//            ws2_32.lib WinDivert.lib
+//
+// WinDivert is needed only for the syn_parker pool tests (header types); no
+// driver or admin rights are involved.
 //
 // /std:c++23 isn't recognized by VS2022 14.44 — use /std:c++latest.
 // /DNOMINMAX — quill/std::numeric_limits collides with windows.h max() macro.
@@ -40,6 +44,7 @@
 #include "rules/traffic_filter.hpp"
 #include "rules/policy_table.hpp"
 #include "core/port_tracker.hpp"
+#include "core/syn_parker.hpp"
 #include "core/system_dns.hpp"
 #include "udp/udp_port_tracker.hpp"
 #include "udp/socks5_udp_session.hpp"
@@ -802,6 +807,119 @@ TEST(port_tracker_word_packing) {
     ASSERT_EQ(word_gen(w2), 0xFFFFFFu);
     ASSERT_EQ(word_idx(w2), NO_POOL_IDX);
     ASSERT_EQ(sizeof(clew::TrackerSlot), (size_t)64);
+}
+
+// ---- syn_parker pool (no injector thread started: pure pool semantics) ----
+
+TEST(syn_parker_pool_alloc_free_generation) {
+    auto pt = std::make_unique<PortTracker>();
+    clew::syn_parker parker(*pt, /*watchdog_ms=*/20, /*pool_size=*/32);
+    ASSERT_EQ(parker.pool_size(), 32u);
+    ASSERT_EQ(parker.watchdog_ms(), 20);
+
+    uint8_t pkt[64] = {1, 2, 3};
+    WINDIVERT_ADDRESS addr{};
+    addr.Timestamp = 777;
+
+    auto a = parker.park(pkt, sizeof(pkt), addr, 5555);
+    ASSERT_TRUE(a.idx != NO_POOL_IDX);
+    ASSERT_EQ(parker.snapshot().pool_in_use, 1u);
+
+    // Freeing bumps the generation, so a stale ref can never match the next owner
+    parker.free_slot(a.idx);
+    ASSERT_EQ(parker.snapshot().pool_in_use, 0u);
+    auto b = parker.park(pkt, sizeof(pkt), addr, 5556);
+    ASSERT_TRUE(b.idx != NO_POOL_IDX);
+    bool reused_same_idx = (b.idx == a.idx);
+    if (reused_same_idx) ASSERT_EQ(b.gen, a.gen + 1);
+    parker.free_slot(b.idx);
+}
+
+TEST(syn_parker_pool_exhaustion_returns_no_idx) {
+    auto pt = std::make_unique<PortTracker>();
+    clew::syn_parker parker(*pt, 20, 32);   // MIN_POOL
+    uint8_t pkt[8] = {};
+    WINDIVERT_ADDRESS addr{};
+
+    std::vector<uint32_t> held;
+    for (uint32_t i = 0; i < 32; ++i) {
+        auto r = parker.park(pkt, sizeof(pkt), addr, static_cast<uint16_t>(1000 + i));
+        ASSERT_TRUE(r.idx != NO_POOL_IDX);
+        held.push_back(r.idx);
+    }
+    ASSERT_EQ(parker.snapshot().pool_in_use, 32u);
+    ASSERT_EQ(parker.snapshot().pool_peak, 32u);
+
+    auto full = parker.park(pkt, sizeof(pkt), addr, 2000);
+    ASSERT_EQ(full.idx, NO_POOL_IDX);
+
+    for (auto idx : held) parker.free_slot(idx);
+    ASSERT_EQ(parker.snapshot().pool_in_use, 0u);   // the leak signal: back to zero
+    auto again = parker.park(pkt, sizeof(pkt), addr, 2001);
+    ASSERT_TRUE(again.idx != NO_POOL_IDX);
+    parker.free_slot(again.idx);
+}
+
+TEST(syn_parker_config_is_clamped) {
+    auto pt = std::make_unique<PortTracker>();
+    clew::syn_parker low(*pt, 1, 4);
+    ASSERT_EQ(low.watchdog_ms(), clew::syn_parker::MIN_WATCHDOG_MS);
+    ASSERT_EQ(low.pool_size(), clew::syn_parker::MIN_POOL);
+    clew::syn_parker high(*pt, 500, 100000);
+    ASSERT_EQ(high.watchdog_ms(), clew::syn_parker::MAX_WATCHDOG_MS);
+    ASSERT_EQ(high.pool_size(), clew::syn_parker::MAX_POOL);
+}
+
+// A PID recycled before its ETW STOP arrives: the rule engine still holds the
+// old owner in matched_pids, and try_match_one skips PIDs it already holds.
+// The manager therefore calls on_process_exit(pid) before inserting the new
+// owner (process_tree_manager::handle_start_or_rundown). This pins the
+// engine behaviour that sequence relies on.
+TEST(rule_engine_recycled_pid_needs_exit_before_rematch) {
+    clew::flat_tree tree;
+    clew::rule_engine_v3 engine;
+    clew::AutoRule rule;
+    rule.id = "curl"; rule.name = "curl"; rule.enabled = true;
+    rule.process_name = "curl.exe"; rule.hack_tree = true; rule.proxy_group_id = 3;
+    engine.set_auto_rules({rule});
+
+    FILETIME ft{};
+    uint32_t old_idx = add_test_entry(tree, 5000, 1, ft, L"curl.exe");   // PSN n
+    ASSERT_TRUE(engine.on_process_start(tree, old_idx).has_value());
+    ASSERT_EQ(tree.at(old_idx).group_id, 3u);
+
+    // Same PID, new PSN (add_test_entry allocates a fresh one), no
+    // on_process_exit in between: the engine skips it.
+    uint32_t new_idx = add_test_entry(tree, 5000, 1, ft, L"curl.exe");   // PSN n+1
+    ASSERT_TRUE(new_idx != old_idx);
+    ASSERT_FALSE(engine.on_process_start(tree, new_idx).has_value());
+    ASSERT_EQ(tree.at(new_idx).group_id, clew::NO_PROXY);
+
+    // With the exit hook first (what the manager does), the new owner matches.
+    engine.on_process_exit(5000);
+    ASSERT_TRUE(engine.on_process_start(tree, new_idx).has_value());
+    ASSERT_EQ(tree.at(new_idx).group_id, 3u);
+}
+
+TEST(tcp_syn_parking_config_defaults_and_roundtrip) {
+    clew::ConfigV2 def;
+    ASSERT_TRUE(def.tcp_syn_parking.enabled);
+    ASSERT_EQ(def.tcp_syn_parking.watchdog_ms, 20);
+    ASSERT_EQ(def.tcp_syn_parking.pool_size, 256);
+
+    // Old config files without the block keep the defaults
+    auto old = nlohmann::json::parse(R"({"version": 2})").get<clew::ConfigV2>();
+    ASSERT_TRUE(old.tcp_syn_parking.enabled);
+
+    auto off = nlohmann::json::parse(R"({"version": 2, "tcp_syn_parking": {"enabled": false, "watchdog_ms": 10}})")
+                   .get<clew::ConfigV2>();
+    ASSERT_FALSE(off.tcp_syn_parking.enabled);
+    ASSERT_EQ(off.tcp_syn_parking.watchdog_ms, 10);
+    ASSERT_EQ(off.tcp_syn_parking.pool_size, 256);
+
+    nlohmann::json out = off;
+    ASSERT_TRUE(out.contains("tcp_syn_parking"));
+    ASSERT_FALSE(out["tcp_syn_parking"]["enabled"].get<bool>());
 }
 
 // ============================================================

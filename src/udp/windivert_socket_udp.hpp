@@ -197,10 +197,10 @@ private:
         // Resolve before the rule gate, not after: should_proxy_protocol looks
         // the PID up in the tree itself and answers false for anything it
         // doesn't know, so a process younger than the ETW ProcessStart latency
-        // would be dropped here before ever reaching the lookup below.
-        if (tree_.find_by_pid(pid) == INVALID_IDX) {
-            if (!resolve_unknown_pid_ || !resolve_unknown_pid_(pid)) return;
-        }
+        // would be dropped here before ever reaching the lookup below. Called
+        // for known PIDs too: it verifies the entry against the live PSN, so
+        // a PID recycled before its ETW STOP arrived is re-resolved.
+        if (resolve_unknown_pid_ && !resolve_unknown_pid_(pid)) return;
 
         // Check if this PID should be proxied for UDP protocol
         if (!rules_.should_proxy_protocol(tree_, pid, "udp")) return;

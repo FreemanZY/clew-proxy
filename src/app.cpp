@@ -52,7 +52,7 @@ app::app(const cli_options& opts, HINSTANCE hinstance)
     , icon_svc_(icons_)
     , process_svc_(exec_)
     , rule_svc_(exec_, cfg_store_)
-    , stats_svc_(exec_)
+    , stats_svc_(exec_, [this]() { return traffic_stats(); })
     , ctx_{
         .config      = config_svc_,
         .connections = connection_svc_,
@@ -84,14 +84,32 @@ app::app(const cli_options& opts, HINSTANCE hinstance)
     redirect_port_ = acceptor_.start();
     PC_LOG_INFO("Acceptor listening on port {}", redirect_port_);
 
+    // SYN parking (kill switch: tcp_syn_parking.enabled). Off means no pool,
+    // no injector thread, and both TCP layers fall back to the pre-parking
+    // code paths — it must bypass the new code entirely, because it is the
+    // one thing left when the new code is what broke.
+    {
+        const auto& sp = config_.get_v2().tcp_syn_parking;
+        if (sp.enabled) {
+            parker_ = std::make_unique<syn_parker>(*port_tracker_, sp.watchdog_ms,
+                                                   static_cast<uint32_t>(std::max(0, sp.pool_size)));
+            PC_LOG_INFO("[SYN-PARK] enabled: watchdog={}ms pool={}",
+                        parker_->watchdog_ms(), parker_->pool_size());
+        } else {
+            PC_LOG_WARN("[SYN-PARK] disabled by config (tcp_syn_parking.enabled=false): "
+                        "a process's first connection may escape interception");
+        }
+    }
+
     // Both SOCKET layers run on the same strand as the tree manager, so the
     // fallback resolve is a plain in-line call — no marshalling needed.
     auto resolve_unknown_pid = [this](DWORD pid) { return tree_mgr_.resolve_pid_now(pid); };
 
     wd_socket_      = std::make_unique<windivert_socket>(ioc_, strand_, tree_mgr_.tree(),
                                                          tree_mgr_.rules(), *port_tracker_,
-                                                         resolve_unknown_pid);
-    wd_network_     = std::make_unique<windivert_network>(*port_tracker_, redirect_port_);
+                                                         resolve_unknown_pid, parker_.get());
+    wd_network_     = std::make_unique<windivert_network>(*port_tracker_, redirect_port_,
+                                                          parker_.get());
     wd_socket_udp_  = std::make_unique<windivert_socket_udp>(ioc_, strand_, tree_mgr_.tree(),
                                                               tree_mgr_.rules(), *udp_port_tracker_,
                                                               resolve_unknown_pid);
@@ -149,6 +167,51 @@ void app::sync_groups() {
         udp_groups_[g.id] = {g.host, g.port};
     }
     PC_LOG_INFO("Proxy groups synced: {} groups", tcp_groups_.size());
+}
+
+nlohmann::json app::traffic_stats() const {
+    nlohmann::json j;
+    if (wd_socket_) {
+        const auto s = wd_socket_->snapshot();
+        j["socket"] = {
+            {"connect_events",        s.connect_events},
+            {"close_events",          s.close_events},
+            {"proxied_decisions",     s.proxied_decisions},
+            {"direct_decisions",      s.direct_decisions},
+            {"self_direct",           s.self_direct},
+            {"echo_ignored",          s.echo_ignored},
+            {"late_rejected",         s.late_rejected},
+            {"late_rejected_proxied", s.late_rejected_proxied},
+            {"close_while_pending",   s.close_while_pending},
+        };
+    }
+    if (parker_) {
+        const auto c = parker_->snapshot();
+        j["parking"] = {
+            {"enabled",              true},
+            {"watchdog_ms",          c.watchdog_ms},
+            {"pool_size",            c.pool_size},
+            {"hires_timer",          c.hires_timer},
+            {"parked",               c.parked},
+            {"released_by_decision", c.released_by_decision},
+            {"released_by_watchdog", c.released_by_watchdog},
+            {"released_by_drain",    c.released_by_drain},
+            {"ttl_stale",            c.ttl_stale},
+            {"dup_syn_dropped",      c.dup_syn_dropped},
+            {"cas_lost_to_decision", c.cas_lost_to_decision},
+            {"pool_exhausted",       c.pool_exhausted},
+            {"oversize",             c.oversize},
+            {"gen_mismatch",         c.gen_mismatch},
+            {"send_failures",        c.send_failures},
+            {"pool_in_use",          c.pool_in_use},
+            {"pool_peak",            c.pool_peak},
+            {"park_us_max",          c.park_us_max},
+            {"park_us_mean",         c.released_by_decision ? c.park_us_sum / c.released_by_decision : 0},
+        };
+    } else {
+        j["parking"] = {{"enabled", false}};
+    }
+    return j;
 }
 
 std::pair<std::string, uint16_t> app::pick_proxy_endpoint() const {
@@ -284,6 +347,9 @@ void app::start_traffic_layers() {
     }
 
     if (wd_network_->open()) {
+        // The injector sends through the NETWORK handle; it must be running
+        // before the workers can park anything.
+        if (parker_) parker_->start(wd_network_->handle(), redirect_port_);
         wd_network_->start(2);
         PC_LOG_INFO("WinDivert NETWORK layer started ({} workers)", 2);
     } else {
@@ -332,6 +398,9 @@ void app::shutdown() noexcept {
     PC_LOG_INFO("UDP layers closed");
 
     if (wd_socket_)  wd_socket_->close();
+    // Drain parked SYNs (sent through the NETWORK handle) before that
+    // handle goes away.
+    if (parker_)     parker_->stop();
     if (wd_network_) wd_network_->close();
     PC_LOG_INFO("WinDivert layers closed");
 

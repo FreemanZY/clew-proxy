@@ -5,6 +5,7 @@
 // get_stats() reads the process tree + rule engine via strand_bound_manager.
 // get_env() is a pure function (no state) reading HTTP_PROXY-family env vars.
 
+#include <functional>
 #include <nlohmann/json.hpp>
 
 #include "domain/strand_bound.hpp"
@@ -13,7 +14,11 @@ namespace clew {
 
 class stats_service {
 public:
-    explicit stats_service(strand_bound_manager& exec);
+    // traffic: optional provider of the WinDivert-layer counters (SOCKET
+    // decisions, SYN parking). Supplied by app so this layer stays free of
+    // the WinDivert headers; its result lands under "tcp_syn_parking".
+    explicit stats_service(strand_bound_manager& exec,
+                           std::function<nlohmann::json()> traffic = {});
 
     stats_service(const stats_service&)            = delete;
     stats_service& operator=(const stats_service&) = delete;
@@ -25,7 +30,8 @@ public:
     [[nodiscard]] static nlohmann::json get_env();
 
 private:
-    strand_bound_manager& exec_;
+    strand_bound_manager&           exec_;
+    std::function<nlohmann::json()> traffic_;
 };
 
 } // namespace clew

@@ -10,7 +10,8 @@
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows",
-        "CLEW_ENABLE_WEBVIEW2": "ON"
+        "CLEW_ENABLE_WEBVIEW2": "ON",
+        "CLEW_PROJECTION_COALESCE": "ON"
       }
     },
     {
@@ -22,6 +23,7 @@
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows",
         "CLEW_ENABLE_WEBVIEW2": "ON",
+        "CLEW_PROJECTION_COALESCE": "ON",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_BUILD_TYPE": "Debug"
       }

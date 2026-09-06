@@ -78,16 +78,8 @@ void process_projection::replay_to_frontend() {
 
 void process_projection::refresh_snapshot() {
     auto json_str = process_tree_to_json_string(mgr_.tree(), mgr_.rules());
-    // CLEW_DEBUG_DIAG_BEGIN — sticky tree bug bisect 2026-05-07, REMOVE after
-    std::size_t pid_count = 0;
-    for (std::size_t pos = 0;
-         (pos = json_str.find("\"pid\":", pos)) != std::string::npos;
-         ++pos) {
-        ++pid_count;
-    }
-    PC_LOG_INFO("[projection] snapshot: {} bytes, {} entries, alive={}",
-                json_str.size(), pid_count, mgr_.tree().alive_count());
-    // CLEW_DEBUG_DIAG_END
+    PC_LOG_DEBUG("[projection] snapshot: {} bytes, alive={}",
+                 json_str.size(), mgr_.tree().alive_count());
     snapshot_.store(std::make_shared<const std::string>(std::move(json_str)));
 }
 

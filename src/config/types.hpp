@@ -266,6 +266,26 @@ struct DnsConfig {
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(DnsConfig, enabled, mode, upstream_host, upstream_port, listen_host, listen_port)
 
+// TCP SYN parking: hold a connection's first SYN until the SOCKET layer has
+// decided whether to proxy it, instead of letting fresh processes' first
+// connection escape. Read at startup only (the pool and injector thread are
+// allocated then); changing it requires a restart.
+//   enabled      kill switch. false = pre-v0.10 behavior (no pool, no injector,
+//                no synchronous PID resolve, two-state tracker), for when the
+//                new code itself misbehaves. Short-lived processes escape
+//                interception again in that mode.
+//   watchdog_ms  how long a SYN may wait for its decision before it is
+//                released direct (clamped 5..50; normal waits are < 1ms).
+//   pool_size    parked SYNs held at once (clamped 32..4096; peak seen 17
+//                under a 300-connection burst).
+struct TcpSynParkingConfig {
+    bool enabled = true;
+    int  watchdog_ms = 20;
+    int  pool_size = 256;
+};
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(TcpSynParkingConfig, enabled, watchdog_ms, pool_size)
+
 struct ConfigV2 {
     int version = 2;
     ProxyTarget default_proxy;
@@ -283,8 +303,9 @@ struct ConfigV2 {
     int io_threads = 0;                         // NEW: 0 = hardware_concurrency()/2
     std::string log_level = "info";             // Runtime log level: debug/info/warning/error
     DnsConfig dns;                              // NEW: DNS proxy configuration
+    TcpSynParkingConfig tcp_syn_parking;        // SYN parking switch + tuning (startup only)
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ConfigV2, version, default_proxy, proxy_groups, next_group_id, default_exclude_cidrs, auto_rules, ui, io_threads, log_level, dns)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ConfigV2, version, default_proxy, proxy_groups, next_group_id, default_exclude_cidrs, auto_rules, ui, io_threads, log_level, dns, tcp_syn_parking)
 
 } // namespace clew
