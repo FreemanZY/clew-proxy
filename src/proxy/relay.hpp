@@ -82,12 +82,24 @@ handle_connection(tcp::socket client_sock,
     if (ep_ec) co_return;  // socket already closed
     const uint16_t src_port = ep.port();
 
-    // Lookup tracker entry
-    auto entry = tracker.take(src_port);
-    if (!entry) {
+    // Lookup tracker entry. The CONNECT timestamp identifies *this* flow: the
+    // app may close, reuse the port and get a fresh decision before we tear
+    // down, and the cleanup below must not wipe that newer flow's slot.
+    auto taken = tracker.take(src_port);
+    if (!taken) {
         PC_LOG_DEBUG("[RELAY] No tracker entry for port {}", src_port);
         co_return;
     }
+    const TrackerEntry* entry = &taken->entry;
+    const int64_t flow_ts = taken->connect_ts;
+
+    // All tracker clears happen on the strand (single writer for state
+    // transitions out of a decided slot); the relay only asks for one.
+    auto release_slot = [&tracker, &strand, src_port, flow_ts]() {
+        asio::post(strand, [&tracker, src_port, flow_ts]() {
+            tracker.clear_if(src_port, flow_ts);
+        });
+    };
 
     // Query group config on strand (enter strand, read, exit immediately)
     struct GroupInfo {
@@ -104,7 +116,7 @@ handle_connection(tcp::socket client_sock,
 
     if (!cfg_opt) {
         PC_LOG_WARN("[RELAY] Group {} not found for port {}", entry->group_id, src_port);
-        tracker.clear(src_port);
+        release_slot();
         co_return;
     }
 
@@ -156,8 +168,8 @@ handle_connection(tcp::socket client_sock,
                      src_port, dest_ip_str, dest_port, e.what());
     }
 
-    // Cleanup tracker entry
-    tracker.clear(src_port);
+    // Cleanup tracker entry (on the strand, guarded by this flow's timestamp)
+    release_slot();
     PC_LOG_DEBUG("[RELAY] Closed port={} ({}:{})", src_port, dest_ip_str, dest_port);
 }
 

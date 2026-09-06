@@ -228,7 +228,7 @@ private:
         te.remote_port = static_cast<uint16_t>(addr.Socket.RemotePort);
         te.group_id = entry.group_id;
 
-        tracker_.put(src_port, te);
+        tracker_.publish(src_port, slot_state::proxied, te, addr.Timestamp);
         match_count_++;
 
         PC_LOG_DEBUG("[WD-SOCKET] Match PID={} port={} -> {}:{} group={}",

@@ -634,59 +634,174 @@ TEST(bug_tree_inherit_stale_matched_pid) {
 
 using clew::PortTracker;
 using clew::TrackerEntry;
+using clew::slot_state;
+using clew::publish_outcome;
+using clew::NO_POOL_IDX;
 
-TEST(port_tracker_put_get) {
-    auto pt = std::make_unique<PortTracker>();
+static TrackerEntry make_entry(uint32_t ip, uint16_t port, uint32_t group) {
     TrackerEntry e;
-    e.remote_addr[0] = 0x0A000001;  // 10.0.0.1
-    e.remote_port = 443;
-    e.group_id = 1;
-
-    ASSERT_FALSE(pt->is_active(8080));
-    pt->put(8080, e);
-    ASSERT_TRUE(pt->is_active(8080));
-    auto& peek = pt->peek(8080);
-    ASSERT_EQ(peek.remote_port, (uint16_t)443);
-    ASSERT_EQ(peek.group_id, 1u);
+    e.remote_addr[0] = ip;
+    e.remote_port    = port;
+    e.group_id       = group;
+    return e;
 }
 
-TEST(port_tracker_take) {
+TEST(port_tracker_publish_proxied_on_empty) {
     auto pt = std::make_unique<PortTracker>();
-    TrackerEntry e;
-    e.remote_port = 80;
-    e.group_id = 2;
-    pt->put(9090, e);
+    auto e = make_entry(0x0A000001, 443, 1);   // 10.0.0.1:443
 
-    auto taken = pt->take(9090);
-    ASSERT_TRUE(taken.has_value());
-    ASSERT_EQ(taken->remote_port, (uint16_t)80);
-    // take() is non-destructive read (clear is separate)
-    ASSERT_TRUE(pt->is_active(9090));
+    ASSERT_FALSE(pt->should_reflect(8080));
+    auto r = pt->publish(8080, slot_state::proxied, e, /*connect_ts=*/1000);
+    ASSERT_TRUE(r.outcome == publish_outcome::stored);
+    ASSERT_TRUE(pt->should_reflect(8080));
+    ASSERT_EQ(pt->peek(8080).remote_port, (uint16_t)443);
+    ASSERT_EQ(pt->peek(8080).group_id, 1u);
 }
 
-TEST(port_tracker_clear) {
+TEST(port_tracker_direct_does_not_reflect) {
     auto pt = std::make_unique<PortTracker>();
-    TrackerEntry e;
-    e.remote_port = 22;
-    pt->put(5000, e);
-    ASSERT_TRUE(pt->is_active(5000));
-    pt->clear(5000);
-    ASSERT_FALSE(pt->is_active(5000));
+    pt->publish(8081, slot_state::direct, make_entry(1, 80, 0), 1000);
+    ASSERT_TRUE(pt->state(8081) == slot_state::direct);
+    ASSERT_FALSE(pt->should_reflect(8081));
 }
 
-TEST(port_tracker_empty_take) {
+TEST(port_tracker_take_carries_timestamp) {
     auto pt = std::make_unique<PortTracker>();
-    auto result = pt->take(12345);
-    ASSERT_FALSE(result.has_value());
+    pt->publish(9090, slot_state::proxied, make_entry(1, 80, 2), 4242);
+
+    auto t = pt->take(9090);
+    ASSERT_TRUE(t.has_value());
+    ASSERT_EQ(t->entry.remote_port, (uint16_t)80);
+    ASSERT_EQ(t->connect_ts, (int64_t)4242);
+    // take() is non-destructive: the NETWORK layer keeps reflecting
+    ASSERT_TRUE(pt->should_reflect(9090));
+
+    // direct slots are not the relay's business
+    pt->publish(9091, slot_state::direct, make_entry(1, 80, 0), 1);
+    ASSERT_FALSE(pt->take(9091).has_value());
+    ASSERT_FALSE(pt->take(12345).has_value());
 }
 
-TEST(port_tracker_overwrite) {
+TEST(port_tracker_clear_if_matches_timestamp_only) {
     auto pt = std::make_unique<PortTracker>();
-    TrackerEntry e1; e1.group_id = 1;
-    TrackerEntry e2; e2.group_id = 2;
-    pt->put(7777, e1);
-    pt->put(7777, e2);
-    ASSERT_EQ(pt->peek(7777).group_id, 2u);
+    pt->publish(5000, slot_state::proxied, make_entry(1, 22, 0), 100);
+    // Newer flow reused the port and published before the old relay tore down
+    pt->publish(5000, slot_state::proxied, make_entry(2, 22, 0), 200);
+
+    ASSERT_FALSE(pt->clear_if(5000, 100));          // old relay: no-op
+    ASSERT_TRUE(pt->should_reflect(5000));
+    ASSERT_TRUE(pt->clear_if(5000, 200));           // current flow: cleared
+    ASSERT_TRUE(pt->state(5000) == slot_state::empty);
+    ASSERT_FALSE(pt->clear_if(5000, 200));          // already empty
+}
+
+TEST(port_tracker_park_then_publish_returns_parked_ref) {
+    auto pt = std::make_unique<PortTracker>();
+    auto v = pt->load(7000);
+    ASSERT_TRUE(v.state() == slot_state::empty);
+
+    ASSERT_TRUE(pt->try_park(7000, v.word, /*gen=*/5, /*idx=*/17));
+    ASSERT_TRUE(pt->state(7000) == slot_state::pending);
+    ASSERT_FALSE(pt->should_reflect(7000));
+    // A second SYN while pending must see pending (caller drops it)
+    ASSERT_FALSE(pt->try_park(7000, v.word, 6, 18));
+
+    auto r = pt->publish(7000, slot_state::proxied, make_entry(1, 443, 3), 900);
+    ASSERT_TRUE(r.outcome == publish_outcome::released_parked);
+    ASSERT_EQ(r.parked.idx, 17u);
+    ASSERT_EQ(r.parked.gen, 5u);
+    ASSERT_TRUE(pt->should_reflect(7000));
+}
+
+TEST(port_tracker_watchdog_pin_rejects_late_decision) {
+    auto pt = std::make_unique<PortTracker>();
+    auto v = pt->load(7001);
+    ASSERT_TRUE(pt->try_park(7001, v.word, 1, 0));
+
+    // Watchdog releases the parked SYN (kernel ts 500) and pins the port
+    auto pending = pt->load(7001);
+    ASSERT_TRUE(pt->pin_abandoned(7001, pending.word, /*syn_ts=*/500));
+    ASSERT_TRUE(pt->state(7001) == slot_state::abandoned);
+
+    // The CONNECT for that same flow (older than the SYN) arrives late: rejected
+    auto late = pt->publish(7001, slot_state::proxied, make_entry(1, 443, 1), 480);
+    ASSERT_TRUE(late.outcome == publish_outcome::late_rejected);
+    ASSERT_TRUE(pt->state(7001) == slot_state::abandoned);
+    ASSERT_FALSE(pt->should_reflect(7001));
+
+    // A genuinely new flow on the reused port (CONNECT newer than the pin) wins
+    auto fresh = pt->publish(7001, slot_state::proxied, make_entry(2, 443, 1), 600);
+    ASSERT_TRUE(fresh.outcome == publish_outcome::stored);
+    ASSERT_TRUE(pt->should_reflect(7001));
+}
+
+TEST(port_tracker_echo_connect_is_recognised) {
+    auto pt = std::make_unique<PortTracker>();
+    const uint32_t remote[4] = {0x01010101, 0, 0, 0};
+    auto e = make_entry(0x01010101, 443, 1);
+    pt->publish(7002, slot_state::proxied, e, 1000);
+
+    // Same remote, well inside the TTL: our own re-injected SYN's CONNECT
+    ASSERT_TRUE(pt->is_echo(7002, 1000 + pt->ms_to_ticks(1), remote, 443));
+    // Different remote endpoint: a real new flow
+    const uint32_t other[4] = {0x02020202, 0, 0, 0};
+    ASSERT_FALSE(pt->is_echo(7002, 1000 + pt->ms_to_ticks(1), other, 443));
+    ASSERT_FALSE(pt->is_echo(7002, 1000 + pt->ms_to_ticks(1), remote, 444));
+    // Same remote but older than the TTL: stale slot, not an echo
+    ASSERT_FALSE(pt->is_echo(7002, 1000 + pt->ms_to_ticks(11), remote, 443));
+    // Empty / pending slots are never echoes
+    ASSERT_FALSE(pt->is_echo(7003, 1000, remote, 443));
+}
+
+TEST(port_tracker_close_state_machine) {
+    auto pt = std::make_unique<PortTracker>();
+
+    // direct -> cleared by CLOSE
+    pt->publish(7010, slot_state::direct, make_entry(1, 80, 0), 100);
+    ASSERT_FALSE(pt->on_close(7010, 150).has_value());
+    ASSERT_TRUE(pt->state(7010) == slot_state::empty);
+
+    // proxied -> CLOSE leaves it to the relay
+    pt->publish(7011, slot_state::proxied, make_entry(1, 80, 0), 100);
+    ASSERT_FALSE(pt->on_close(7011, 150).has_value());
+    ASSERT_TRUE(pt->should_reflect(7011));
+
+    // stale CLOSE (older than the slot's CONNECT) is ignored
+    pt->publish(7012, slot_state::direct, make_entry(1, 80, 0), 300);
+    ASSERT_FALSE(pt->on_close(7012, 250).has_value());
+    ASSERT_TRUE(pt->state(7012) == slot_state::direct);
+
+    // pending -> CLOSE empties the slot and hands back the pool index
+    auto v = pt->load(7013);
+    ASSERT_TRUE(pt->try_park(7013, v.word, 9, 42));
+    auto idx = pt->on_close(7013, 150);
+    ASSERT_TRUE(idx.has_value());
+    ASSERT_EQ(*idx, 42u);
+    ASSERT_TRUE(pt->state(7013) == slot_state::empty);
+
+    // abandoned -> cleared by CLOSE
+    v = pt->load(7014);
+    ASSERT_TRUE(pt->try_park(7014, v.word, 1, 1));
+    ASSERT_TRUE(pt->pin_abandoned(7014, pt->load(7014).word, 500));
+    ASSERT_FALSE(pt->on_close(7014, 600).has_value());
+    ASSERT_TRUE(pt->state(7014) == slot_state::empty);
+
+    // empty -> nothing
+    ASSERT_FALSE(pt->on_close(7015, 1).has_value());
+}
+
+TEST(port_tracker_word_packing) {
+    using clew::pack_word; using clew::word_state; using clew::word_gen; using clew::word_idx;
+    const uint64_t w = pack_word(slot_state::pending, 0xABCDEFu, 123456789u);
+    ASSERT_TRUE(word_state(w) == slot_state::pending);
+    ASSERT_EQ(word_gen(w), 0xABCDEFu);
+    ASSERT_EQ(word_idx(w), 123456789u);
+    // generation is 24 bits: high bits are masked, never leak into the state byte
+    const uint64_t w2 = pack_word(slot_state::direct, 0xFFFFFFFFu, NO_POOL_IDX);
+    ASSERT_TRUE(word_state(w2) == slot_state::direct);
+    ASSERT_EQ(word_gen(w2), 0xFFFFFFu);
+    ASSERT_EQ(word_idx(w2), NO_POOL_IDX);
+    ASSERT_EQ(sizeof(clew::TrackerSlot), (size_t)64);
 }
 
 // ============================================================

@@ -126,7 +126,7 @@ private:
 
             // === Hot path: check if this connection is tracked ===
             // Outbound from tracked app: src_port is the app's ephemeral port
-            if (tracker_.is_active(src_port)) {
+            if (tracker_.should_reflect(src_port)) {
                 // Cold path: NAT rewrite (Reflection)
                 reflect_outbound(pkt_buf, pkt_len, ip, tcp, src_port, &addr);
                 nat_count_.fetch_add(1, std::memory_order_relaxed);
@@ -191,7 +191,7 @@ private:
                        uint16_t app_port, WINDIVERT_ADDRESS* addr)
     {
         // Lookup original destination from tracker (entry persists until connection close)
-        if (!tracker_.is_active(app_port)) {
+        if (!tracker_.should_reflect(app_port)) {
             // Unknown or already-closed connection — passthrough
             WinDivertSend(handle_, pkt_buf, pkt_len, nullptr, addr);
             return;
