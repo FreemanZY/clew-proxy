@@ -181,7 +181,7 @@ defineExpose({ fetchRules })
 </script>
 
 <template>
-  <div class="flex-1 overflow-auto flex flex-col">
+  <div class="flex-1 overflow-auto thin-scrollbar flex flex-col">
     <!-- ============ TOOLBAR ============ -->
     <div class="shrink-0 border-b border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-[#18181b]/50">
 
@@ -291,7 +291,7 @@ defineExpose({ fetchRules })
     </div>
 
     <!-- ============ RULE LIST ============ -->
-    <div class="flex-1 overflow-auto divide-y divide-slate-100 dark:divide-slate-800/40">
+    <div class="flex-1 overflow-auto thin-scrollbar divide-y divide-slate-100 dark:divide-slate-800/40">
       <div
         v-for="rule in filteredRules"
         :key="rule.id"

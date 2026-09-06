@@ -283,7 +283,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="flex flex-col h-full overflow-auto">
+  <div class="flex flex-col h-full overflow-auto thin-scrollbar">
     <div class="p-6 flex flex-col gap-6 flex-1 min-h-0">
       <!-- General Section -->
       <div class="max-w-xl">

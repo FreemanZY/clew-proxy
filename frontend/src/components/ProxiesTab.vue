@@ -192,7 +192,7 @@ onMounted(fetchData)
 </script>
 
 <template>
-  <div class="flex-1 overflow-auto flex flex-col">
+  <div class="flex-1 overflow-auto thin-scrollbar flex flex-col">
     <!-- Toolbar -->
     <div class="shrink-0 border-b border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-[#18181b]/50">
       <div class="h-12 flex items-center gap-3 px-4">
@@ -227,7 +227,7 @@ onMounted(fetchData)
     </div>
 
     <!-- Group cards -->
-    <div class="flex-1 overflow-auto p-4 space-y-3">
+    <div class="flex-1 overflow-auto thin-scrollbar p-4 space-y-3">
       <Card
         v-for="group in filteredGroups"
         :key="group.id"
