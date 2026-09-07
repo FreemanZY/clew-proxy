@@ -110,7 +110,7 @@ src/
 frontend/                            - Vue 3 + TypeScript (built static files served by cpp-httplib)
 tests/
   test_components.cpp                - Component-level unit tests (wildcard, flat_tree, etc.)
-  e2e_api_test.py                    - 19-case HTTP integration suite (requests-based)
+  e2e_api_test.py                    - 22-case HTTP integration suite (requests-based); `-k SUBSTR` runs a subset
   run_all.py                         - admin-shell harness: launch + wait-ready + run + teardown
   playwright_e2e/
     poc_attach.py                    - Playwright + WebView2 CDP attach PoC
@@ -506,8 +506,9 @@ The autostart Task Scheduler entry pins `--config <abs path>` explicitly so a sy
 
 ### E2E testing strategy: log-scan over Playwright timing
 
-The HTTP e2e suite runs 21 cases against a live clew.exe; the Playwright suite runs 3. The split is deliberate:
+The HTTP e2e suite runs 22 cases against a live clew.exe; the Playwright suite runs 3. The split is deliberate:
 
+- **Traffic interception is judged by the exit IP, never by counters.** The suite copies `System32\curl.exe` to a private name (`clew_e2e_curl.exe`) so its rule cannot collide with the user's own `curl.exe` rule, measures two references once per run (through `--proxy socks5://127.0.0.1:7890`, and direct with `trust_env=False`), and refuses to run when the two are equal, because the proxy would then be routing the target DIRECT. Then 20 sequential and 20 concurrent fresh probe processes must all report the proxy's exit IP, and a control case with the rule disabled must report the direct IP. `tcp_syn_parking` deltas (`proxied_decisions`, `released_by_watchdog`, `late_rejected`, `pool_in_use`) are secondary evidence: a wrong decision published on time leaves every counter quiet (see "TCP SYN parking").
 - **HTTP / log-scan** (`tests/e2e_api_test.py`) — anything assertable from `clew.log` lives here. T22 (batch_hijack single notify, was T14) counts `[tree-change] source=batch_hijack` lines in a measurement window; T23 (DELETE 60ms regression net for the cpp-httplib bug) reads the server-side elapsed time from the `[api] DELETE … (Xus)` line. Both are independent of the frontend's own timing — V8 contention can't make these tests flaky. The suite flips `log_level=debug` at startup and restores on exit (`try/finally`), so DEBUG lines like `[tree-change]` are visible inside the run without polluting default behaviour.
 - **Playwright** (`tests/playwright_e2e/run_pw.py`) — only UI-side regressions that pure HTTP can't observe: no `/api/events` fetch ever made (no SSE leak), backend push reaches the Vue tree, no HTTP polling under ETW load. **Removed**: T14 batch single-push (replaced by T22 log-scan), DELETE 60ms (replaced by T23 log-scan), stress UI responsiveness (Playwright `page.evaluate` competes with V8 main-thread push processing, RTTs measured through CDP are several times higher than actual backend latency — wrong tool for that question).
 

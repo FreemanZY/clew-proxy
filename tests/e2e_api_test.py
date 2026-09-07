@@ -8,15 +8,17 @@ Usage:
     python e2e_api_test.py
 """
 
+import os
 import pathlib
 import queue
 import re
 import requests
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-import json
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Iterator
@@ -24,8 +26,25 @@ from typing import Iterator
 BASE = "http://127.0.0.1:18080/api"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 7890
-TEST_TARGET = "http://httpbin.org/ip"  # Returns requester's IP
-CURL_EXE = "curl.exe"
+
+# Traffic probe: a private copy of curl.exe under a name only this suite
+# matches. The user's own instance usually carries a `curl.exe` rule; the
+# control case (rule disabled -> direct) must never touch that one.
+# System32 curl is a single static binary (schannel); MSYS/mingw curl needs
+# its DLL neighbours and would not start from a copy.
+PROBE_NAME = "clew_e2e_curl.exe"
+PROBE_DIR  = pathlib.Path(tempfile.gettempdir()) / "clew_e2e"
+PROBE_EXE  = PROBE_DIR / PROBE_NAME
+SYSTEM_CURL = pathlib.Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+
+# Exit-IP oracle targets. Each returns the caller's public IP as plain text
+# (or JSON with an "origin"/"ip" field). Override with CLEW_E2E_IP_URL.
+IP_URL_CANDIDATES = [
+    "https://ifconfig.me/ip",
+    "https://api.ipify.org",
+    "https://icanhazip.com",
+]
+PROBE_ARGS = ["-s", "--connect-timeout", "10", "-m", "20", "--noproxy", "*"]
 
 # clew.log lives next to clew.exe (since v0.9.0 chdir was reverted in favor
 # of explicit exe-dir resolution). Tests scan it for tagged events that
@@ -182,7 +201,7 @@ def test_create_rule():
     r = requests.post(f"{BASE}/auto-rules", json={
         "name": TEST_RULE_NAME,
         "enabled": True,
-        "process_name": CURL_EXE,
+        "process_name": PROBE_NAME,
         "cmdline_pattern": "",
         "image_path_pattern": "",
         "hack_tree": False,
@@ -214,79 +233,183 @@ def test_list_rules():
 
 
 # ============================================================
-# 3. Traffic Interception (curl.exe through proxy)
+# 3. Traffic interception — correctness gate on the exit IP
+#
+# Every probe is a brand-new process that connects immediately (the
+# escape case SYN parking exists for). The only assertion that proves a
+# connection went through the proxy is the public IP the far end saw:
+# counters can stay quiet while a wrong decision is published on time
+# (the 14/200 storm misses of 2026-09-07 did exactly that).
 # ============================================================
 
-@test("curl.exe gets hijacked by auto rule")
-def test_curl_hijacked():
-    # Launch curl.exe — it should be caught by our "curl.exe" rule
-    # Use --connect-timeout to avoid hanging
-    proc = subprocess.Popen(
-        ["curl", "-s", "--connect-timeout", "10", TEST_TARGET],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+# IPv4 or IPv6: a proxy egress may be v6-preferred while the direct path
+# is v4. Only equality of the token matters, never the family.
+_IP_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}|(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4})")
+
+
+def _prepare_probe() -> None:
+    PROBE_DIR.mkdir(parents=True, exist_ok=True)
+    src = SYSTEM_CURL
+    if not src.exists():
+        found = shutil.which("curl")
+        if not found:
+            raise RuntimeError("no curl.exe found (System32 or PATH)")
+        print(f"WARN: {SYSTEM_CURL} missing, copying {found} instead "
+              "(non-static builds may fail to start)", file=sys.stderr)
+        src = pathlib.Path(found)
+    shutil.copy2(src, PROBE_EXE)
+
+
+def _remove_probe() -> None:
+    shutil.rmtree(PROBE_DIR, ignore_errors=True)
+
+
+def _probe_env() -> dict:
+    """Child environment with every *_proxy variable removed. A proxy env
+    var sends the probe to 127.0.0.1 (loopback, never intercepted) and
+    hides the hijack — see lesson: system proxy masks hijack."""
+    return {k: v for k, v in os.environ.items() if not k.lower().endswith("_proxy")}
+
+
+def _spawn_probe(url: str, extra: list[str] | None = None) -> subprocess.Popen:
+    return subprocess.Popen(
+        [str(PROBE_EXE), *PROBE_ARGS, *(extra or []), url],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=_probe_env(),
     )
 
-    # Wait a moment for Clew to intercept
-    time.sleep(1)
 
-    # /api/processes was retired; query /api/hijack which returns the
-    # currently-hijacked PIDs with their names (subset we care about).
-    r = requests.get(f"{BASE}/hijack")
-    hijacked = r.json() or []
-    curl_node = next(
-        (h for h in hijacked if h.get("name", "").lower() == CURL_EXE), None
-    )
-    # curl might have finished already, so just check if we can find connections
-    r_tcp = requests.get(f"{BASE}/tcp")
-    tcp_conns = r_tcp.json()
-    curl_conns = [c for c in tcp_conns if c.get("process_name", "").lower() == CURL_EXE]
-
-    # Wait for curl to finish
-    stdout, _ = proc.communicate(timeout=15)
-    exit_code = proc.returncode
-
-    # curl should have completed (either success or proxy error)
-    # The key test: was it intercepted?
-    if curl_node and curl_node.get("hijacked"):
-        print(f"    curl PID={curl_node['pid']} hijacked=True")
-    elif curl_conns:
-        proxied = [c for c in curl_conns if c.get("proxy_status") == "PROXIED"]
-        print(f"    Found {len(curl_conns)} curl connections, {len(proxied)} proxied")
-    else:
-        print(f"    curl exit={exit_code}, stdout={stdout[:200]}")
-
-    # Success if curl ran and either got hijacked or we saw its connections
-    assert exit_code is not None, "curl didn't finish"
+def _finish_probe(p: subprocess.Popen) -> tuple[int, str]:
+    out, err = p.communicate(timeout=40)
+    m = _IP_RE.search(out or "")
+    return p.returncode, (m.group(1) if m else (out or err or "").strip()[:80])
 
 
-@test("Proxied curl returns different IP than direct")
-def test_proxy_routing():
-    # Direct request (no proxy)
-    try:
-        direct = requests.get(TEST_TARGET, timeout=10)
-        direct_ip = direct.json().get("origin", "")
-    except Exception:
-        direct_ip = "unknown"
+def _run_probe(url: str, extra: list[str] | None = None) -> tuple[int, str]:
+    return _finish_probe(_spawn_probe(url, extra))
 
-    # Request through Clew (curl.exe is hijacked by our rule)
-    proc = subprocess.run(
-        ["curl", "-s", "--connect-timeout", "10", TEST_TARGET],
-        capture_output=True, text=True, timeout=15
-    )
 
-    if proc.returncode == 0 and proc.stdout.strip():
+_oracle: dict | None = None
+
+
+def _resolve_ip_oracle() -> dict:
+    """Pick a target and measure both reference IPs once per run.
+      proxy_ip  — probe with --proxy socks5://127.0.0.1:7890. Loopback is
+                  never intercepted, and socks5:// (not socks5h://) resolves
+                  locally so the proxy sees the same destination IP as it
+                  does on the hijacked path.
+      direct_ip — python requests, trust_env=False (python.exe has no rule).
+    Refuses to run when the two are equal: the target would then be routed
+    DIRECT by the proxy and every assertion below would be meaningless."""
+    global _oracle
+    if _oracle is not None:
+        return _oracle
+    override = os.environ.get("CLEW_E2E_IP_URL")
+    candidates = [override] if override else IP_URL_CANDIDATES
+    tried = []
+    direct_session = requests.Session()
+    direct_session.trust_env = False     # ignore *_proxy env vars
+    for url in candidates:
         try:
-            proxied_ip = json.loads(proc.stdout).get("origin", "")
-            print(f"    Direct IP: {direct_ip}, Proxied IP: {proxied_ip}")
-            if direct_ip != "unknown" and proxied_ip:
-                # If proxy is working, IPs should differ (unless proxy exits at same IP)
-                assert proxied_ip, "No IP returned from proxied request"
-            else:
-                print("    (Cannot compare IPs, but request succeeded)")
-        except json.JSONDecodeError:
-            print(f"    curl output: {proc.stdout[:200]}")
-    else:
-        print(f"    curl exit={proc.returncode}, stderr={proc.stderr[:200]}")
+            r = direct_session.get(url, timeout=10)
+            m = _IP_RE.search(r.text)
+            direct_ip = m.group(1) if m else None
+        except Exception as e:
+            tried.append(f"{url}: direct failed ({type(e).__name__}: {e})")
+            continue
+        rc, proxy_ip = _run_probe(url, ["--proxy", f"socks5://{PROXY_HOST}:{PROXY_PORT}"])
+        if not direct_ip or rc != 0 or not _IP_RE.fullmatch(proxy_ip):
+            tried.append(f"{url}: direct={direct_ip} proxy rc={rc} out={proxy_ip!r}")
+            continue
+        if direct_ip == proxy_ip:
+            tried.append(f"{url}: proxy exit == direct ({direct_ip}); "
+                         "the proxy routes this target DIRECT")
+            continue
+        _oracle = {"url": url, "direct_ip": direct_ip, "proxy_ip": proxy_ip}
+        print(f"    oracle: {url}  direct={direct_ip}  proxy={proxy_ip}")
+        return _oracle
+    raise AssertionError("no usable exit-IP target (set CLEW_E2E_IP_URL): "
+                         + "; ".join(tried))
+
+
+def _parking_stats() -> dict | None:
+    """tcp_syn_parking block of /api/stats, or None when parking is off."""
+    s = requests.get(f"{BASE}/stats", timeout=5).json()
+    return s.get("tcp_syn_parking")
+
+
+def _assert_all_exit(results: list[tuple[int, str]], want_ip: str, label: str) -> None:
+    bad = [(i, rc, ip) for i, (rc, ip) in enumerate(results) if ip != want_ip]
+    n = len(results)
+    print(f"    {label}: {n - len(bad)}/{n} exit={want_ip}")
+    assert not bad, (f"{len(bad)}/{n} probes did not exit via {want_ip}: "
+                     + ", ".join(f"#{i} rc={rc} got={ip!r}" for i, rc, ip in bad[:10]))
+
+
+def _assert_parking_delta(before: dict | None, n: int) -> None:
+    """Secondary evidence. Requires /api/stats to carry tcp_syn_parking."""
+    if before is None:
+        print("    (tcp_syn_parking absent: parking disabled, counters skipped)")
+        return
+    time.sleep(0.5)
+    after = _parking_stats()
+    assert after is not None, "tcp_syn_parking vanished mid-run"
+    ps, pa = before["parking"], after["parking"]
+    ss, sa = before["socket"], after["socket"]
+    d_proxied  = sa["proxied_decisions"] - ss["proxied_decisions"]
+    d_watchdog = pa["released_by_watchdog"] - ps["released_by_watchdog"]
+    d_late     = sa["late_rejected"] - ss["late_rejected"]
+    print(f"    counters: proxied+{d_proxied} parked+{pa['parked'] - ps['parked']} "
+          f"watchdog+{d_watchdog} late+{d_late} pool_in_use={pa['pool_in_use']} "
+          f"pool_peak={pa['pool_peak']}")
+    assert d_proxied >= n, f"proxied_decisions rose by {d_proxied}, expected >= {n}"
+    assert d_watchdog == 0, f"released_by_watchdog rose by {d_watchdog}"
+    assert d_late == 0, f"late_rejected rose by {d_late}"
+    assert pa["pool_in_use"] == 0, f"pool_in_use={pa['pool_in_use']} after settle"
+
+
+SEQ_N   = 20
+BURST_N = 20
+CTRL_N  = 5
+
+
+@test(f"fresh probe processes, sequential: {SEQ_N}/{SEQ_N} exit via proxy")
+def test_probe_sequential():
+    o = _resolve_ip_oracle()
+    before = _parking_stats()
+    results = [_run_probe(o["url"]) for _ in range(SEQ_N)]
+    _assert_all_exit(results, o["proxy_ip"], "sequential")
+    _assert_parking_delta(before, SEQ_N)
+
+
+@test(f"fresh probe processes, concurrent burst: {BURST_N}/{BURST_N} exit via proxy")
+def test_probe_burst():
+    o = _resolve_ip_oracle()
+    before = _parking_stats()
+    procs = [_spawn_probe(o["url"]) for _ in range(BURST_N)]
+    results = [_finish_probe(p) for p in procs]
+    _assert_all_exit(results, o["proxy_ip"], "burst")
+    _assert_parking_delta(before, BURST_N)
+
+
+@test(f"control: probe with rule disabled -> {CTRL_N}/{CTRL_N} exit direct")
+def test_probe_rule_disabled_goes_direct():
+    """Proves the gate can go red and that disabling a rule really stops
+    interception. PUT /api/auto-rules/:id is a patch (rule_handlers.cpp)."""
+    o = _resolve_ip_oracle()
+    rules = requests.get(f"{BASE}/auto-rules").json()
+    rule = next((r for r in rules if r["name"] == TEST_RULE_NAME), None)
+    assert rule is not None, "test rule missing"
+    rid = rule["id"]
+    r = requests.put(f"{BASE}/auto-rules/{rid}", json={"enabled": False})
+    assert r.status_code == 200, f"disable failed: {r.status_code} {r.text}"
+    try:
+        time.sleep(0.3)
+        results = [_run_probe(o["url"]) for _ in range(CTRL_N)]
+        _assert_all_exit(results, o["direct_ip"], "rule disabled")
+    finally:
+        r = requests.put(f"{BASE}/auto-rules/{rid}", json={"enabled": True})
+        assert r.status_code == 200, f"re-enable failed: {r.status_code} {r.text}"
 
 
 # ============================================================
@@ -888,6 +1011,15 @@ if __name__ == "__main__":
     print("Clew E2E API Test")
     print("=" * 60)
 
+    # -k SUBSTR: run only cases whose name contains SUBSTR (case-insensitive).
+    # The rule create/cleanup cases are always kept as setup/teardown.
+    name_filter = None
+    if len(sys.argv) >= 3 and sys.argv[1] == "-k":
+        name_filter = sys.argv[2].lower()
+    elif len(sys.argv) > 1:
+        print("usage: e2e_api_test.py [-k SUBSTR]", file=sys.stderr)
+        sys.exit(2)
+
     # Check connectivity first
     try:
         requests.get(f"{BASE}/stats", timeout=2)
@@ -929,8 +1061,9 @@ if __name__ == "__main__":
         # (test_no_event_source / test_push_after_hijack).
         test_create_rule,
         test_list_rules,
-        test_curl_hijacked,
-        test_proxy_routing,
+        test_probe_sequential,                   # exit-IP gate, fresh processes
+        test_probe_burst,
+        test_probe_rule_disabled_goes_direct,    # control: the gate can go red
         test_manual_hijack,
         test_batch_hijack_single_notify,         # T22 — log-scan rewrite
         test_delete_under_60ms_serverside,       # T23 — log-scan rewrite
@@ -946,10 +1079,17 @@ if __name__ == "__main__":
         test_dns_proxy_roundtrip,
     ]
 
+    if name_filter:
+        keep = {test_create_rule, test_cleanup_rule}
+        tests = [t for t in tests if t in keep or name_filter in t.__name__.lower()]
+        print(f"filter -k {name_filter!r}: {len(tests)} cases\n")
+
     try:
+        _prepare_probe()
         for t in tests:
             t()
     finally:
+        _remove_probe()
         # Always restore log_level — verify.sh reuses the same clew.exe
         # process across phases, and a leftover debug level would persist
         # into clew.json on disk via config_store::mutate.
