@@ -52,9 +52,7 @@ src/
                                        + pushes through frontend_push_sink with a
                                        100 ms strand-timer coalesce window for
                                        push_urgency::batched events
-    config_sse_bridge.{hpp,cpp}      - config_store observer → push auto_rule_changed
-                                       (file name retained for git history; the sink
-                                       is now PostMessage, not SSE)
+    config_push_bridge.{hpp,cpp}     - config_store observer → push auto_rule_changed
 
   transport/                     - HTTP API server + push channel interface
     http_api_server.{hpp,cpp}        - cpp-httplib server + 8-worker thread pool
@@ -81,8 +79,7 @@ src/
 
   process/                       - process discovery + tree
     flat_tree.hpp                    - vector<process_entry> + LC-RS indices, O(1) PID lookup
-    etw_consumer.hpp                 - ETW real-time ProcessStart / ProcessStop consumer
-    ntquery_snapshot.hpp             - Initial full process snapshot via NtQuerySystemInformation
+    etw_consumer.hpp                 - ETW ProcessStart / ProcessStop consumer; capture_state rundown builds the initial tree
     tcp_table.hpp / udp_table.hpp    - OS connection table queries
 
   rules/                         - auto-rule matching + traffic filtering
@@ -132,11 +129,12 @@ assets/
 - One shared `strand` serializes all process tree + rule engine mutations (zero mutex in hot path)
 - ETW events, process start/stop, rule changes all dispatched through the strand
 
-### Process tree: ETW + NtQuery snapshot + Flat Tree
+### Process tree: ETW rundown + Flat Tree
 
 - Real-time ETW `ProcessStart` / `ProcessStop` instead of polling
-- `ntquery_snapshot` provides the initial full tree; ETW maintains it incrementally
-- `process_tree_manager` orchestrates: ETW + NtQuery + Flat Tree + Rule Engine
+- The initial tree comes from the same ETW session: `EVENT_CONTROL_CODE_CAPTURE_STATE` makes the provider emit one `ProcessRundown` event per live process, with the same layout as `ProcessStart`. There is no separate `NtQuerySystemInformation` snapshot.
+- When the session reports lost events, `process_tree_manager` re-issues capture_state after a short grace period and reconciles
+- `process_tree_manager` orchestrates: ETW + Flat Tree + Rule Engine
 
 ### Flat Tree with LC-RS (Left-Child Right-Sibling)
 
@@ -242,7 +240,7 @@ backend stops doing tree-snapshot work entirely. Implementation:
 Net effect (measured under sustained 270 ETW events/sec at tree=1200):
 strand utilisation 48% visible → 0.0% hidden, hijack wait_us tail 940 ms →
 92 µs (any user CRUD waiting in the queue still completes; just nothing
-new piling up). See `memory/MEMORY.md` for the v0.8.9 release notes.
+new piling up).
 
 ### Autostart on logon (Task Scheduler, v0.9.0)
 
@@ -275,8 +273,7 @@ The fix is on the client side. `frontend/src/api/client.ts` always passes
 0 → return immediately), and the handler runs in <2 ms. The server-side
 alternative (`set_payload_max_length(SIZE_MAX)`) was avoided because it opens
 the server to unbounded payload allocations; a one-line client change is the
-proportional fix. See `memory/lesson_cpp_httplib_delete_5s.md` for the full
-diagnosis trail.
+proportional fix.
 
 ### WinDivert dual-layer
 

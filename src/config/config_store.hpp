@@ -2,9 +2,9 @@
 
 // Thin wrapper around clew::config_manager. Provides the only config access
 // point for HTTP handlers, application services, and cross-cutting observers
-// (rule_engine sync, SSE bridge, auth_middleware, DNS manager, ...).
+// (rule_engine sync, config push bridge, auth_middleware, DNS manager, ...).
 //
-// See refactor_docs/DESIGN.md H2 + H5.
+// See clew_refactor/DESIGN.md H2 + H5.
 //
 // Semantics:
 //   - get()            : returns a full ConfigV2 copy (a few KB, microsecond).

@@ -142,7 +142,8 @@ public:
     }
 
 private:
-    // Ensure proxy_groups is populated (migration from default_proxy / inline proxy)
+    // A config without proxy_groups gets group 0 from default_proxy. Rules
+    // already carry proxy_group_id (0 when absent), so nothing else moves.
     void ensure_proxy_groups() {
         if (!v2_config_.proxy_groups.empty()) return;
 
@@ -151,38 +152,10 @@ private:
         default_group.name = "default";
         default_group.host = v2_config_.default_proxy.host;
         default_group.port = v2_config_.default_proxy.port;
-        default_group.type = v2_config_.default_proxy.type;
+        default_group.type = "socks5";
         v2_config_.proxy_groups.push_back(default_group);
 
-        for (auto& rule : v2_config_.auto_rules) {
-            if (rule.proxy.host.empty()) {
-                rule.proxy_group_id = 0;
-                continue;
-            }
-
-            bool found = false;
-            for (const auto& g : v2_config_.proxy_groups) {
-                if (g.host == rule.proxy.host && g.port == rule.proxy.port &&
-                    g.type == rule.proxy.type) {
-                    rule.proxy_group_id = g.id;
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found) {
-                ProxyGroup new_group;
-                new_group.id = v2_config_.next_group_id++;
-                new_group.name = std::format("group_{}", new_group.id);
-                new_group.host = rule.proxy.host;
-                new_group.port = rule.proxy.port;
-                new_group.type = rule.proxy.type;
-                rule.proxy_group_id = new_group.id;
-                v2_config_.proxy_groups.push_back(new_group);
-            }
-        }
-
-        PC_LOG_INFO("Migrated proxy config: {} groups created", v2_config_.proxy_groups.size());
+        PC_LOG_INFO("proxy_groups was empty; created group 0 from default_proxy");
         save();
     }
 };

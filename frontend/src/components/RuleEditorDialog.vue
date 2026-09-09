@@ -24,7 +24,7 @@ import {
 } from '@/components/ui/tooltip'
 import TagInput from '@/components/TagInput.vue'
 import { getProxyGroups, browseExe as apiBrowseExe } from '@/api/client'
-import type { AutoRule, ProxyTarget, ProxyGroup, TrafficFilter, RuleProtocol } from '@/api/types'
+import type { AutoRule, ProxyGroup, TrafficFilter, RuleProtocol } from '@/api/types'
 import {
   ChevronRight,
   HelpCircle,
@@ -73,8 +73,6 @@ const formHackTree = ref(true)
 const formProtocol = ref<RuleProtocol>('tcp')
 const proxyGroups = ref<ProxyGroup[]>([])
 const formProxyGroupId = ref('0')
-const isCustomProxy = ref(false)
-const customProxyHost = ref('')
 const formExcludeCidrs = ref<string[]>([])
 const formIncludePorts = ref<string[]>([])
 const advancedOpen = ref(false)
@@ -93,8 +91,6 @@ watch(() => props.open, async (open) => {
       formHackTree.value = true  // v0.9.0: always tree-mode
       formProtocol.value = props.rule.protocol || 'tcp'
       formProxyGroupId.value = String(props.rule.proxy_group_id ?? 0)
-      isCustomProxy.value = false
-      customProxyHost.value = ''
       formExcludeCidrs.value = [...props.rule.dst_filter.exclude_cidrs]
       formIncludePorts.value = [...props.rule.dst_filter.include_ports]
       formWorkDir.value = props.rule.image_path_pattern || ''
@@ -109,8 +105,6 @@ watch(() => props.open, async (open) => {
       formHackTree.value = true
       formProtocol.value = 'tcp'
       formProxyGroupId.value = '0'
-      isCustomProxy.value = false
-      customProxyHost.value = ''
       formExcludeCidrs.value = []
       formIncludePorts.value = []
       formWorkDir.value = pDir
@@ -158,14 +152,6 @@ const selectedGroup = computed(() =>
 const canSave = computed(() => formName.value.trim() && formProcessName.value.trim())
 
 function onSave() {
-  let proxy: ProxyTarget
-  if (isCustomProxy.value && customProxyHost.value) {
-    const parts = customProxyHost.value.split(':')
-    proxy = { type: 'socks5', host: parts[0] || '127.0.0.1', port: Number.parseInt(parts[1] ?? '7890') || 7890 }
-  } else {
-    const group = selectedGroup.value
-    proxy = { type: group?.type ?? 'socks5', host: group?.host ?? '127.0.0.1', port: group?.port ?? 7890 }
-  }
   const dst_filter: TrafficFilter = {
     exclude_cidrs: formExcludeCidrs.value,
     include_cidrs: [],
@@ -181,7 +167,6 @@ function onSave() {
     hack_tree: formHackTree.value,
     protocol: formProtocol.value,
     proxy_group_id: Number.parseInt(formProxyGroupId.value, 10),
-    proxy,
     dst_filter,
   })
 }
@@ -354,16 +339,12 @@ function onClose(value: boolean) {
 
             <!-- Group selector with styled badges -->
             <Select
-              :model-value="isCustomProxy ? 'custom' : formProxyGroupId"
-              @update:model-value="(v: unknown) => { const s = String(v ?? ''); if (s === 'custom') { isCustomProxy = true } else { isCustomProxy = false; formProxyGroupId = s } }"
+              :model-value="formProxyGroupId"
+              @update:model-value="(v: unknown) => { formProxyGroupId = String(v ?? '') }"
             >
               <SelectTrigger :id="proxyGroupId" class="h-[42px] bg-slate-50 dark:bg-[#101922] border-slate-200 dark:border-slate-800 focus:ring-1 focus:ring-blue-500">
                 <div class="flex items-center gap-2">
-                  <template v-if="isCustomProxy">
-                    <span class="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-blue-600 text-white tracking-tight">custom</span>
-                    <span class="text-xs text-slate-500 dark:text-slate-400 font-mono">{{ customProxyHost || '—' }}</span>
-                  </template>
-                  <template v-else-if="selectedGroup">
+                  <template v-if="selectedGroup">
                     <span class="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-slate-800 dark:bg-slate-200 text-slate-100 dark:text-slate-800 tracking-tight shrink-0">
                       {{ selectedGroup.name }}
                     </span>
@@ -385,22 +366,8 @@ function onClose(value: boolean) {
                     </span>
                   </div>
                 </SelectItem>
-                <SelectItem value="custom" class="py-2">
-                  <div class="flex items-center gap-2">
-                    <span class="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-blue-600 text-white tracking-tight">custom</span>
-                    <span class="text-xs text-slate-500 dark:text-slate-400">Enter address manually...</span>
-                  </div>
-                </SelectItem>
               </SelectContent>
             </Select>
-
-            <!-- Custom proxy input -->
-            <div v-if="isCustomProxy" class="flex items-stretch rounded-lg border border-slate-200 dark:border-slate-800 overflow-hidden focus-within:ring-1 focus-within:ring-blue-500 focus-within:border-blue-500 transition-all">
-              <div class="flex items-center px-3 bg-slate-100 dark:bg-[#1c242c] border-r border-slate-200 dark:border-slate-800 select-none">
-                <span class="text-xs font-mono font-semibold text-slate-500 dark:text-slate-400 tracking-wide">socks5://</span>
-              </div>
-              <input v-model="customProxyHost" class="flex-1 bg-slate-50 dark:bg-[#101922] px-3 py-2.5 text-sm font-mono text-slate-800 dark:text-white outline-none" type="text" spellcheck="false" autocomplete="off" placeholder="127.0.0.1:7890" />
-            </div>
           </div>
 
           <!-- Advanced Accordion -->

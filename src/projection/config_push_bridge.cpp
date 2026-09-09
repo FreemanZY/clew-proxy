@@ -1,4 +1,4 @@
-#include "projection/config_sse_bridge.hpp"
+#include "projection/config_push_bridge.hpp"
 
 #include <string>
 #include <string_view>
@@ -33,7 +33,7 @@ std::string_view tag_to_action(config_change tag) noexcept {
 
 } // namespace
 
-config_sse_bridge::config_sse_bridge(config_store& cfg) {
+config_push_bridge::config_push_bridge(config_store& cfg) {
     cfg.subscribe([this](const ConfigV2&, config_change tag) {
         auto* sink = sink_.load();
         if (!sink) return;

@@ -44,7 +44,21 @@ nlohmann::json group_service::list_groups() const {
     return arr;
 }
 
+namespace {
+
+// The relay speaks SOCKS5 only. Reject other types at the API instead of
+// storing a group the relay cannot use.
+void require_socks5(const nlohmann::json& j) {
+    if (j.contains("type") && j.at("type") != "socks5") {
+        throw api_exception{api_error::invalid_argument,
+                            "Unsupported proxy type; only socks5 is supported"};
+    }
+}
+
+} // namespace
+
 nlohmann::json group_service::create_group(const nlohmann::json& body) {
+    require_socks5(body);
     ProxyGroup group;
     cfg_.mutate(
         [&group, &body](ConfigV2& c) {
@@ -61,6 +75,7 @@ nlohmann::json group_service::create_group(const nlohmann::json& body) {
 }
 
 void group_service::update_group(std::uint32_t id, const nlohmann::json& patch) {
+    require_socks5(patch);
     bool found = false;
     cfg_.mutate(
         [&found, id, &patch](ConfigV2& c) {

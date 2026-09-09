@@ -84,7 +84,6 @@ void rule_service::update_rule(std::string_view id, const nlohmann::json& patch)
                         field_binding{"hack_tree",          &AutoRule::hack_tree},
                         field_binding{"proxy_group_id",     &AutoRule::proxy_group_id},
                         field_binding{"protocol",           &AutoRule::protocol},
-                        field_binding{"proxy",              &AutoRule::proxy},
                         field_binding{"dst_filter",         &AutoRule::dst_filter});
                     break;
                 }

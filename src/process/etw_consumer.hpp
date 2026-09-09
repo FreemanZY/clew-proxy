@@ -16,10 +16,31 @@
 //     (cumulative) and posts an EVENTS_LOST DTO each time it grows. The
 //     manager debounces and re-issues capture_state.
 //
-// PoC verification report:
-//   F:/projects/remote_projects/win_prox/tools/poc/poc_etw_kernel_process_v2_report.md
-// Schema reference (field names, InTypes, sentinel values):
-//   ~/.claude/projects/F--projects-remote-projects-win-prox/memory/reference/etw_kernel_process.md
+// Provider: Microsoft-Windows-Kernel-Process {22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716},
+// keyword 0x10, event ids 1 (ProcessStart v3), 2 (ProcessStop v2),
+// 15 (ProcessRundown, same layout as ProcessStart v3). Layouts below were
+// read back with TDH on Windows 10 and 11; the manifest is not enough
+// because it does not say which string encodings are used.
+//
+//   ProcessStart v3: ProcessID u32, ProcessSequenceNumber u64,
+//     CreateTime FILETIME, ParentProcessID u32,
+//     ParentProcessSequenceNumber u64, SessionID u32, Flags u32,
+//     ProcessTokenElevationType u32, ProcessTokenIsElevated u32,
+//     MandatoryLabel SID, ImageName UTF-16, ImageChecksum u32,
+//     TimeDateStamp u32, PackageFullName UTF-16, PackageRelativeAppId UTF-16.
+//   ProcessStop v2: ProcessID u32, ProcessSequenceNumber u64,
+//     CreateTime FILETIME, ExitTime FILETIME, ExitCode u32,
+//     TokenElevationType u32, HandleCount u32, CommitCharge u64,
+//     CommitPeak u64, CPUCycleCount u64, ReadOperationCount u32,
+//     WriteOperationCount u32, ReadTransferKiloBytes u32,
+//     WriteTransferKiloBytes u32, HardFaultCount u32, ImageName ANSI.
+//
+// Three details the decoder depends on:
+//   - MandatoryLabel is TDH_INTYPE_SID (8 + 4 * SubAuthorityCount bytes),
+//     not WBEMSID; it sits before ImageName and must be skipped exactly.
+//   - ImageName is UTF-16 in ProcessStart but ANSI in ProcessStop.
+//   - ImageName is an NT device path (\Device\HarddiskVolumeN\...); the
+//     tree stores only the last path component.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

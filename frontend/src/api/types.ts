@@ -1,4 +1,4 @@
-export type ProxyProtocol = 'socks5' | 'http'
+export type ProxyProtocol = 'socks5'
 export type RuleProtocol = 'tcp' | 'udp' | 'both'
 export type HijackSource = 'manual' | 'auto' | ''
 
@@ -11,14 +11,6 @@ export interface ProcessInfo {
   children?: ProcessInfo[]
   cmdline?: string
   image_path?: string
-}
-
-export interface ProxyTarget {
-  type: ProxyProtocol
-  host: string
-  port: number
-  user?: string
-  password?: string
 }
 
 export interface TrafficFilter {
@@ -39,7 +31,6 @@ export interface AutoRule {
   protocol?: RuleProtocol
   dst_filter: TrafficFilter
   proxy_group_id: number
-  proxy: ProxyTarget
   matched_count?: number
   excluded_count?: number
   matched_pids?: { pid: number; name: string; excluded: boolean }[]

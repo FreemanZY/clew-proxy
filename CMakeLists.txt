@@ -89,7 +89,7 @@ link_directories(
 )
 
 # Source files. Historically header-only, but the three-layer refactor
-# (see refactor_docs/DESIGN.md) progressively introduces hpp/cpp-split
+# (see clew_refactor/DESIGN.md) progressively introduces hpp/cpp-split
 # translation units. The legacy http_api_server.cpp remains until Stage 4
 # retires it in favour of src/transport/*.
 set(CLEW_SOURCES
@@ -108,7 +108,7 @@ set(CLEW_SOURCES
     src/services/shell_service.cpp
     src/services/stats_service.cpp
     src/projection/process_projection.cpp
-    src/projection/config_sse_bridge.cpp
+    src/projection/config_push_bridge.cpp
     src/transport/response_utils.cpp
     src/transport/middleware.cpp
     src/transport/route_registry.cpp

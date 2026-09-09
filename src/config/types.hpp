@@ -120,11 +120,12 @@ inline void from_json(const nlohmann::json& j, PortRange& r) {
 }
 
 // ============================================================
-// Proxy Target - Per-rule proxy destination
+// Proxy Target - ConfigV2::default_proxy. Only read when proxy_groups is
+// empty, to seed group 0. Rules reference groups, never a target directly.
 // ============================================================
 
 struct ProxyTarget {
-    std::string type = "socks5";   // "socks5" | "http"
+    std::string type = "socks5";   // always "socks5"
     std::string host = "127.0.0.1";
     uint16_t port = 7890;
     std::string user;              // Optional auth
@@ -150,7 +151,7 @@ struct ProxyGroup {
     std::string name = "default";       // Display name
     std::string host = "127.0.0.1";
     uint16_t port = 7890;
-    std::string type = "socks5";        // Only "socks5" for now
+    std::string type = "socks5";        // always "socks5"; group_service rejects anything else
     std::string test_url = "http://www.gstatic.com/generate_204";
 
     std::string to_string() const {
@@ -194,7 +195,6 @@ struct AutoRule {
     TrafficFilter dst_filter;
     uint32_t proxy_group_id = 0;    // References ProxyGroup, 0 = default group
     std::string protocol = "tcp";   // "tcp", "udp", or "both"
-    ProxyTarget proxy;              // Legacy: kept for backward compat during migration
 
     // Runtime helpers
     bool matches_tcp() const { return protocol == "tcp" || protocol == "both"; }
@@ -216,8 +216,7 @@ inline void to_json(nlohmann::json& j, const AutoRule& r) {
         {"hack_tree", r.hack_tree},
         {"dst_filter", r.dst_filter},
         {"proxy_group_id", r.proxy_group_id},
-        {"protocol", r.protocol},
-        {"proxy", r.proxy}
+        {"protocol", r.protocol}
     };
 }
 
@@ -232,7 +231,7 @@ inline void from_json(const nlohmann::json& j, AutoRule& r) {
     if (j.contains("dst_filter")) j.at("dst_filter").get_to(r.dst_filter);
     r.proxy_group_id = j.value("proxy_group_id", 0u);
     r.protocol = j.value("protocol", std::string("tcp"));
-    if (j.contains("proxy")) j.at("proxy").get_to(r.proxy);
+    // "proxy" (a per-rule ProxyTarget from before proxy groups) is ignored if present.
     // Runtime state not deserialized
 }
 

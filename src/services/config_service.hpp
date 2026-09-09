@@ -2,7 +2,7 @@
 
 // config_service — raw-JSON access for /api/config (Monaco editor).
 // GET returns the last persisted JSON; PUT validates + persists + fires
-// config_store observers (rule_engine sync, SSE bridge, auth_middleware).
+// config_store observers (rule_engine sync, config push bridge, auth_middleware).
 
 #include <string>
 #include <string_view>

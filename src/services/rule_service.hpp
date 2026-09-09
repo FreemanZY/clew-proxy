@@ -5,7 +5,7 @@
 // CRUD operations go through config_store.mutate (source of truth); the
 // config_store observer (registered in main.cpp) picks up the change and
 // runs rule_engine.apply_auto_rules inside the strand, which in turn fires
-// tree_change_receiver and thus SSE.
+// tree_change_receiver and thus the frontend push.
 //
 // list_rules reads via strand_bound_manager to see runtime state fields
 // (matched_pids, excluded_pids) that are maintained in-strand.

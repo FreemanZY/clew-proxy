@@ -1,7 +1,7 @@
 #pragma once
 
 // Process-tree → JSON serialization. Used by both:
-//   - projection/process_projection.cpp (builds the SSE-driven snapshot)
+//   - projection/process_projection.cpp (builds the snapshot pushed to the frontend)
 //   - services/process_tree_service.cpp (HTTP /api/processes/:pid endpoints)
 // Header-only so each translation unit gets its own inline copy; the
 // functions are tiny and nlohmann::json is already a heavy include.

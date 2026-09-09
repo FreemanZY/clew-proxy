@@ -211,7 +211,6 @@ def test_create_rule():
             "include_cidrs": [], "exclude_cidrs": [],
             "include_ports": [], "exclude_ports": [],
         },
-        "proxy": {"type": "socks5", "host": PROXY_HOST, "port": PROXY_PORT},
     })
     assert r.status_code == 200 or r.status_code == 201, f"Status {r.status_code}: {r.text}"
     data = r.json()
@@ -701,7 +700,6 @@ def test_config_put_reloads_rules():
         "hack_tree": False,
         "protocol": "tcp",
         "proxy_group_id": 0,
-        "proxy": {"type": "socks5", "host": "127.0.0.1", "port": 7890, "user": "", "password": ""},
         "dst_filter": {"include_cidrs": [], "exclude_cidrs": [],
                         "include_ports": [], "exclude_ports": []},
     }]
@@ -815,7 +813,6 @@ def test_group_delete_in_use():
         "proxy_group_id": gid,
         "dst_filter": {"include_cidrs": [], "exclude_cidrs": [],
                         "include_ports": [], "exclude_ports": []},
-        "proxy": {"type": "socks5", "host": "127.0.0.1", "port": 7890},
     })
     assert rr.status_code == 200
 
@@ -853,7 +850,6 @@ def test_group_migrate():
         "proxy_group_id": src_id,
         "dst_filter": {"include_cidrs": [], "exclude_cidrs": [],
                         "include_ports": [], "exclude_ports": []},
-        "proxy": {"type": "socks5", "host": "127.0.0.1", "port": 7890},
     })
     assert rr.status_code == 200
 
