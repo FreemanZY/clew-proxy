@@ -346,10 +346,11 @@ def main() -> int:
                 if isinstance(tree, list) and len(tree) > 0:
                     break
                 time.sleep(0.1)
-            assert isinstance(tree, list) and len(tree) > 0, (
-                "tree never populated via __clew_debug bridge — frontend "
-                "rebuild needed? (cd frontend && npm run build)"
-            )
+            if not (isinstance(tree, list) and len(tree) > 0):
+                raise RuntimeError(
+                    "tree never populated via __clew_debug bridge — frontend "
+                    "rebuild needed? (cd frontend && npm run build)"
+                )
 
             print()
             print("=" * 60)

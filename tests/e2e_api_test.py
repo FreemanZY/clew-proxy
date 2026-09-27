@@ -776,7 +776,8 @@ def test_group_crud():
     assert r.status_code == 200, f"create failed: {r.status_code} {r.text}"
     created = r.json()
     gid = created.get("id")
-    assert isinstance(gid, int) and gid > 0, f"expected positive gid, got {created}"
+    assert isinstance(gid, int), f"expected integer gid, got {created}"
+    assert gid > 0, f"expected positive gid, got {created}"
 
     r = requests.put(f"{BASE}/proxy-groups/{gid}", json={"port": 8888})
     assert r.status_code == 200, f"update failed: {r.text}"

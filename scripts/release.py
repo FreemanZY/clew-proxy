@@ -146,6 +146,10 @@ def main() -> None:
     new_tag = args.version or bump_patch(prev_tag)
     if not new_tag.startswith("v"):
         new_tag = "v" + new_tag
+    # The tag goes into git arguments and into the zip file name; accept
+    # nothing but vMAJOR.MINOR.PATCH.
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", new_tag):
+        sys.exit(f"  ERROR: invalid version '{new_tag}' — expected vMAJOR.MINOR.PATCH")
     print(f"  target tag:   {new_tag}")
 
     if sh(["git", "tag", "--list", new_tag]):
