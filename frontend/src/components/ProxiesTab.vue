@@ -201,6 +201,7 @@ onMounted(fetchData)
           <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
           <input
             v-model="searchQuery"
+            aria-label="Search proxy groups"
             placeholder="Search groups..."
             class="w-full pl-8 pr-7 py-1.5 text-xs rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#101922] text-slate-800 dark:text-white placeholder:text-slate-400 outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors"
           />

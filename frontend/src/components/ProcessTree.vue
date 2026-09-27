@@ -258,6 +258,7 @@ function isAutoHijacked(node: ProcessInfo): boolean {
         <input
           v-model="searchQuery"
           type="text"
+          aria-label="Search processes by PID or name"
           placeholder="Search PID or name..."
           class="w-full pl-9 pr-9 py-1.5 text-sm bg-white dark:bg-[#09090b] border border-slate-200 dark:border-slate-700 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-all placeholder:text-slate-400 dark:placeholder:text-slate-600 text-slate-800 dark:text-slate-200"
         />

@@ -224,6 +224,7 @@ onUnmounted(() => {
         <Search class="absolute left-2 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground pointer-events-none" />
         <Input
           v-model="filterText"
+          aria-label="Filter connections by target address or state"
           placeholder="Filter target address or state..."
           class="h-8 pl-7 text-xs"
         />

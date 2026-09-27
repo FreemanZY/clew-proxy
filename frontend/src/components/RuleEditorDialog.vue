@@ -247,7 +247,7 @@ function onClose(value: boolean) {
                 <Button variant="outline" @click="browseExe" class="h-[42px] flex items-center gap-1.5 bg-slate-50 dark:bg-[#1c242c] border-slate-200 dark:border-slate-800 hover:text-blue-600 dark:hover:border-blue-500">
                   <FolderOpen class="w-4 h-4" /> Browse
                 </Button>
-                <input type="file" accept=".exe" class="hidden" ref="fileInput" @change="onExeSelected" />
+                <input type="file" accept=".exe" class="hidden" ref="fileInput" aria-label="Executable file" @change="onExeSelected" />
               </div>
 
               <!-- Working Dir Row -->
@@ -256,16 +256,20 @@ function onClose(value: boolean) {
                 :class="formUseWorkDir ? '' : 'opacity-40'"
               >
                 <Lock class="w-4 h-4 text-slate-400 flex-shrink-0" />
-                <input readonly class="flex-1 bg-transparent text-xs font-mono text-slate-500 dark:text-slate-400 outline-none select-all" :value="formWorkDir" placeholder="Select an executable to auto-fill" />
+                <input readonly aria-label="Working directory" class="flex-1 bg-transparent text-xs font-mono text-slate-500 dark:text-slate-400 outline-none select-all" :value="formWorkDir" placeholder="Select an executable to auto-fill" />
                 <div class="flex items-center gap-2 flex-shrink-0 border-l border-slate-200 dark:border-slate-800 pl-3 ml-1">
                   <span class="text-xs font-medium text-slate-500 dark:text-slate-400">Use as filter</span>
-                  <div
+                  <button
+                    type="button"
+                    role="switch"
+                    :aria-checked="formUseWorkDir"
+                    aria-label="Use working directory as filter"
                     class="w-8 h-4 rounded-full p-[2px] cursor-pointer relative transition-colors"
                     :class="formUseWorkDir ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-700'"
                     @click="formUseWorkDir = !formUseWorkDir"
                   >
-                    <div class="w-3 h-3 bg-white rounded-full transition-transform absolute" :class="formUseWorkDir ? 'translate-x-4' : 'translate-x-0'" />
-                  </div>
+                    <div class="w-3 h-3 bg-white rounded-full transition-transform absolute top-[2px] left-[2px]" :class="formUseWorkDir ? 'translate-x-4' : 'translate-x-0'" />
+                  </button>
                 </div>
               </div>
             </div>

@@ -188,7 +188,11 @@ defineExpose({ fetchRules })
       <!-- Normal toolbar (no selection) -->
       <div v-if="!hasSelection" class="h-12 flex items-center gap-3 px-4">
         <!-- Select all checkbox -->
-        <div
+        <button
+          type="button"
+          role="checkbox"
+          :aria-checked="allSelected ? 'true' : someSelected ? 'mixed' : 'false'"
+          aria-label="Select all rules"
           class="w-4 h-4 rounded border cursor-pointer flex items-center justify-center shrink-0 transition-colors"
           :class="allSelected
             ? 'bg-blue-600 border-blue-600'
@@ -199,13 +203,14 @@ defineExpose({ fetchRules })
         >
           <svg v-if="allSelected" class="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" /></svg>
           <svg v-else-if="someSelected" class="w-3 h-3 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" d="M5 12h14" /></svg>
-        </div>
+        </button>
 
         <!-- Search -->
         <div class="relative flex-1 max-w-[240px]">
           <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
           <input
             v-model="searchQuery"
+            aria-label="Search rules"
             placeholder="Search rules..."
             class="w-full pl-8 pr-7 py-1.5 text-xs rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-[#101922] text-slate-800 dark:text-white placeholder:text-slate-400 outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors"
           />
@@ -244,14 +249,18 @@ defineExpose({ fetchRules })
 
       <!-- Batch action toolbar (selection active) -->
       <div v-else class="h-12 flex items-center gap-3 px-4">
-        <div
+        <button
+          type="button"
+          role="checkbox"
+          :aria-checked="allSelected ? 'true' : 'mixed'"
+          aria-label="Select all rules"
           class="w-4 h-4 rounded border cursor-pointer flex items-center justify-center shrink-0 transition-colors"
           :class="allSelected ? 'bg-blue-600 border-blue-600' : 'bg-blue-600/20 border-blue-500'"
           @click="toggleSelectAll"
         >
           <svg v-if="allSelected" class="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" /></svg>
           <svg v-else class="w-3 h-3 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" d="M5 12h14" /></svg>
-        </div>
+        </button>
 
         <span class="text-xs font-semibold text-blue-600 dark:text-blue-400">
           {{ selectedIds.size }} selected
@@ -299,7 +308,11 @@ defineExpose({ fetchRules })
         :class="selectedIds.has(rule.id) ? 'bg-blue-50/60 dark:bg-blue-900/10' : 'hover:bg-slate-50 dark:hover:bg-[#18181b]/60'"
       >
         <!-- Checkbox -->
-        <div
+        <button
+          type="button"
+          role="checkbox"
+          :aria-checked="selectedIds.has(rule.id)"
+          :aria-label="`Select rule ${rule.name}`"
           class="w-4 h-4 rounded border cursor-pointer flex items-center justify-center shrink-0 transition-colors"
           :class="selectedIds.has(rule.id)
             ? 'bg-blue-600 border-blue-600'
@@ -307,16 +320,20 @@ defineExpose({ fetchRules })
           @click.stop="toggleSelect(rule.id)"
         >
           <svg v-if="selectedIds.has(rule.id)" class="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" /></svg>
-        </div>
+        </button>
 
         <!-- Toggle switch -->
-        <div
+        <button
+          type="button"
+          role="switch"
+          :aria-checked="rule.enabled"
+          :aria-label="`Enable rule ${rule.name}`"
           class="w-8 h-4 rounded-full p-[2px] cursor-pointer relative transition-colors shrink-0"
           :class="rule.enabled ? 'bg-blue-600' : 'bg-slate-300 dark:bg-slate-700'"
           @click="toggleRule(rule.id)"
         >
-          <div class="w-3 h-3 bg-white rounded-full transition-transform absolute" :class="rule.enabled ? 'translate-x-4' : 'translate-x-0'" />
-        </div>
+          <div class="w-3 h-3 bg-white rounded-full transition-transform absolute top-[2px] left-[2px]" :class="rule.enabled ? 'translate-x-4' : 'translate-x-0'" />
+        </button>
 
         <!-- Info -->
         <div class="flex-1 min-w-0">

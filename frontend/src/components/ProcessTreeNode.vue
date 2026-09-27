@@ -130,11 +130,19 @@ function onUnhack(e: Event) {
     <div
       class="group flex py-1.5 pr-2 rounded cursor-pointer transition-colors border-l-2"
       :class="[rowClass, matchClass]"
+      tabindex="0"
       @click="onRowClick"
+      @keydown.enter.space.prevent="onRowClick"
       :title="node.cmdline || node.name"
     >
       <!-- Expand arrow -->
-      <div class="w-5 flex items-center justify-center shrink-0" @click="onArrowClick">
+      <div
+        class="w-5 flex items-center justify-center shrink-0"
+        :tabindex="hasChildren ? 0 : -1"
+        :aria-label="hasChildren ? (expanded ? 'Collapse' : 'Expand') : undefined"
+        @click="onArrowClick"
+        @keydown.enter.space.prevent="onArrowClick"
+      >
         <div
           v-if="hasChildren"
           class="p-0.5 rounded transition-colors hover:bg-slate-200 dark:hover:bg-slate-700"

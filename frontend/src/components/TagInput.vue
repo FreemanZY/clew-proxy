@@ -41,14 +41,16 @@ function onKeydown(e: KeyboardEvent) {
 
 <template>
   <div class="flex flex-wrap gap-1.5 p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-[#101922] min-h-[42px] focus-within:ring-1 focus-within:ring-blue-500 transition-all cursor-text">
-    <span
+    <button
       v-for="(tag, i) in modelValue"
       :key="i"
+      type="button"
+      :aria-label="`Remove ${tag}`"
       class="font-mono text-[11px] bg-slate-200/50 dark:bg-[#1c242c] text-slate-700 dark:text-slate-300 px-2 py-0.5 border border-slate-300 dark:border-slate-700 rounded cursor-pointer hover:border-red-500 hover:text-red-500 inline-flex items-center gap-1 transition-colors"
       @click="removeTag(i)"
     >
       {{ tag }} <X class="w-3 h-3" />
-    </span>
+    </button>
     <input
       :id="id"
       v-model="inputValue"
